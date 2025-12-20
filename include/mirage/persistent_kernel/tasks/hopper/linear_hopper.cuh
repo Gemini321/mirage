@@ -209,7 +209,11 @@ __device__ __forceinline__ void
     }
   }
 
+#ifdef USE_DYNAMIC_WORKER
+  wg_sync<WORKER_NUM_THREADS>(2);
+#else
   __syncthreads();
+#endif
 
   // warp specialization data movement warpgroup
   if (warpgroup_id == NUM_WARPGROUPS - 1) {
@@ -358,7 +362,11 @@ __device__ __forceinline__ void
     }
   }
   store_async_wait<0>();
+#ifdef USE_DYNAMIC_WORKER
+  wg_sync<WORKER_NUM_THREADS>(2);
+#else
   __syncthreads();
+#endif
 }
 
 } // namespace kernel

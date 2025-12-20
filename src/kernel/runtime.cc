@@ -624,6 +624,7 @@ TaskGraphResult print_task_graph(
   mirage::transpiler::CodeKeeper tgbody;
   tgbody.inc_indent();
   code.e("#include \"persistent_kernel.cuh\"");
+  code.e("#include <cutlass/arch/reg_reconfig.h>");
   if (use_json_format) {
     code.e("#include <nlohmann/json.hpp>");
     code.e("#include <fstream>");
@@ -1416,21 +1417,44 @@ TaskGraphResult print_task_graph(
   code.e("__device__ __forceinline__");
   code.e("void _execute_task(TaskDesc const* task_desc,");
   code.e("                   RuntimeConfig const &runtime_config) {");
+  code.e("__shared__ int __mirage_task_done;");
   TaskRegister *task_register = TaskRegister::get_instance();
-  bool first_task = true;
   for (auto const &task : task_register->all_task_variants) {
     for (size_t variant_id = 0; variant_id < task.second.size(); variant_id++) {
-      std::string cond = first_task ? "if" : "else if";
       assert(task_type_to_name.find(task.first) != task_type_to_name.end());
-      code.e("$ (task_desc->task_type == $ && task_desc->variant_id == $) {",
-             cond,
+      code.e("if (task_desc->task_type == $ && task_desc->variant_id == $) {",
              task_type_to_name[task.first],
              variant_id);
-      code.e("$", task.second[variant_id]);
-      code.e("}");
-      first_task = false;
-    }
-  }
+	      code.e("if (threadIdx.x == 0) __mirage_task_done = 0;");
+	      code.e("__syncthreads();");
+	      code.e("if (threadIdx.x < 256) {");
+	      code.e("#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && defined(MIRAGE_USE_SETMAXNREG)");
+	      code.e("wg_increase_regs<232>();");
+	      code.e("#endif");
+	      code.e("$", task.second[variant_id]);
+	      code.e("if ((threadIdx.x % 128) == 0) {");
+	      code.e("atomicAdd(&__mirage_task_done, 1);");
+	      code.e("}");
+	      code.e("#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && defined(MIRAGE_USE_SETMAXNREG)");
+	      code.e("wg_decrease_regs<120>();");
+	      code.e("#endif");
+	      code.e("}");
+	      code.e("else {");
+	      code.e("#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && defined(MIRAGE_USE_SETMAXNREG)");
+	      code.e("wg_decrease_regs<24>();");
+	      code.e("#endif");
+	      code.e("while (__mirage_task_done < 2) {");
+	      code.e("__nanosleep(10);");
+	      code.e("}");
+	      code.e("#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && defined(MIRAGE_USE_SETMAXNREG)");
+	      code.e("wg_increase_regs<120>();");
+	      code.e("#endif");
+	      code.e("}");
+	      code.e("__syncthreads();");
+	        code.e("return;");
+		      code.e("}");
+	    }
+	  }
   code.e("}");
 
   // Write json to output file

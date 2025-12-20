@@ -263,7 +263,11 @@ __device__ __forceinline__ void
                       1);
   }
 
+#ifdef USE_DYNAMIC_WORKER
+  wg_sync<WORKER_NUM_THREADS>(2);
+#else
   __syncthreads();
+#endif
 
   // Represent the SMEM buffers for A and B
   cute::Tensor sA =
@@ -302,7 +306,11 @@ __device__ __forceinline__ void
       cute::print(tCsB);
       printf("\n");
     }
-    __syncthreads();
+  #ifdef USE_DYNAMIC_WORKER
+  wg_sync<WORKER_NUM_THREADS>(2);
+#else
+  __syncthreads();
+#endif
 #endif
 
   int tma_transaction_bytes_A =

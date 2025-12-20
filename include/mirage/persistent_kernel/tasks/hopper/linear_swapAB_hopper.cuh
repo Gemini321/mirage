@@ -208,7 +208,11 @@ __device__ __forceinline__ void linear_swapAB_kernel_hopper(
     }
   }
 
+#ifdef USE_DYNAMIC_WORKER
+  wg_sync<WORKER_NUM_THREADS>(2);
+#else
   __syncthreads();
+#endif
 
   // warp specialization data movement warpgroup
   if (warpgroup_id == NUM_WARPGROUPS - 1) {

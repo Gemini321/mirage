@@ -5,6 +5,10 @@ import subprocess
 import shutil
 import sys
 import sysconfig
+import re
+import shlex
+from pathlib import Path
+from typing import Optional
 
 from .core import *
 from .kernel import get_key_paths, KNGraph, TBGraph
@@ -176,6 +180,7 @@ def get_compile_command(
     flags = flags + [f"-DMPK_MAX_SEQ_LENGTH={mpk.max_seq_length}"]
     # Use when debugging
     # flags = flags + [f"-DMPK_ENABLE_VERBOSE"]
+    flags = flags + [f"-DMIRAGE_USE_SETMAXNREG"]
 
     if use_nvshmem:
         nvshmem_cmd = [
@@ -212,6 +217,59 @@ def get_compile_command(
         flags = flags + ["-DMPK_ENABLE_PROFILING"]
 
     return common_cmd + specific_cmd + flags
+
+
+def _maybe_patch_megakernel_so(
+    so_path: str,
+    *,
+    reg: Optional[int],
+    kernel_substr: str = "worker_kernel",
+    dump_dir: Optional[str] = None,
+) -> str:
+    """
+    Optionally patch embedded worker_kernel regcount metadata inside a compiled
+    megakernel shared library, returning the path to the (possibly) patched .so.
+    """
+    if reg is None:
+        return so_path
+    if not (32 <= int(reg) <= 256):
+        raise ValueError(f"patch reg must be in 32 ~ 256, got {reg}")
+
+    repo_mirage_root = Path(__file__).resolve().parents[2]
+    patch_script = repo_mirage_root / "patch_mpk_worker_kernel_so.py"
+    if not patch_script.exists():
+        raise FileNotFoundError(f"missing patch script: {patch_script}")
+
+    in_path = Path(so_path)
+    out_path = in_path.with_suffix(in_path.suffix + ".patched.so")
+    dump_path = Path(dump_dir) if dump_dir else out_path.parent
+
+    cmd = [
+        sys.executable,
+        str(patch_script),
+        "--so",
+        str(in_path),
+        "--out",
+        str(out_path),
+        "--reg",
+        str(int(reg)),
+        "--kernel-substr",
+        kernel_substr,
+        "--dump-dir",
+        str(dump_path),
+        # "--no-sass",
+        "--no-launch-test",
+    ]
+    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        sys.stdout.write(proc.stdout or "")
+        sys.stderr.write(proc.stderr or "")
+        raise subprocess.CalledProcessError(proc.returncode, cmd, output=proc.stdout, stderr=proc.stderr)
+    if proc.stdout:
+        sys.stdout.write(proc.stdout)
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+    return str(out_path)
 
 
 class PersistentKernel:
@@ -1269,6 +1327,13 @@ class PersistentKernel:
         assert not self._is_compiled
         
         output_dir = kwargs.get("output_dir", None)
+        report_regs_kw = bool(kwargs.get("report_regs", False))
+        noinline_wrappers_kw = bool(kwargs.get("noinline_task_wrappers", False))
+        keep_artifacts_kw = bool(kwargs.get("keep_cuda_artifacts", False))
+        patch_worker_kernel_reg_kw = kwargs.get("patch_worker_kernel_reg", None)
+        if patch_worker_kernel_reg_kw is None:
+            env_reg = os.environ.get("MIRAGE_PATCH_WORKER_KERNEL_REG", "").strip()
+            patch_worker_kernel_reg_kw = int(env_reg) if env_reg else None
 
         MIRAGE_ROOT, INCLUDE_PATH, DEPS_PATH = get_key_paths()
         tempdir_obj = tempfile.TemporaryDirectory()
@@ -1282,7 +1347,24 @@ class PersistentKernel:
         with open(json_file_path, "w") as f:
             f.write(results["json_file"])
         with open(cuda_code_path, "w") as f:
-            f.write(results["cuda_code"] + HARD_CODE)
+            cuda_code = results["cuda_code"]
+
+            # Optional: help attribute per-task register usage by making each task
+            # branch in `_execute_task` call a dedicated `__noinline__` wrapper.
+            # Enable by setting MIRAGE_NOINLINE_TASK_WRAPPERS=1 or passing
+            # noinline_task_wrappers=True to compile().
+            #
+            # If MIRAGE_REPORT_REGS/report_regs is enabled, we also auto-enable
+            # these wrappers so ptxas can report per-branch register usage.
+            report_regs_env = os.environ.get("MIRAGE_REPORT_REGS", "0") == "1"
+            noinline_env = os.environ.get("MIRAGE_NOINLINE_TASK_WRAPPERS", "0") == "1"
+            enable_noinline_wrappers = noinline_wrappers_kw or report_regs_kw or report_regs_env or noinline_env
+            if enable_noinline_wrappers:
+                try:
+                    cuda_code = _inject_noinline_task_wrappers(cuda_code)
+                except Exception as e:
+                    print(f"Warning: failed to inject noinline wrappers: {e}")
+            f.write(cuda_code + HARD_CODE)
             
         if output_dir is not None:
             os.makedirs(output_dir, exist_ok=True)
@@ -1402,9 +1484,95 @@ class PersistentKernel:
         )
         print("Compiling megakernel using the following command line:")
         print(cc_cmd)
-        subprocess.check_call(cc_cmd)
+
+        report_regs = report_regs_kw or os.environ.get("MIRAGE_REPORT_REGS", "0") == "1"
+        keep_artifacts = keep_artifacts_kw or os.environ.get("MIRAGE_KEEP_CUDA_ARTIFACTS", "0") == "1"
+        if report_regs and "--resource-usage" not in cc_cmd:
+            cc_cmd = cc_cmd + ["--resource-usage"]
+        if keep_artifacts and "--keep" not in cc_cmd:
+            keep_dir = os.path.join(output_dir or tempdir, "nvcc_keep")
+            os.makedirs(keep_dir, exist_ok=True)
+            cc_cmd = cc_cmd + ["--keep", f"--keep-dir={keep_dir}"]
+
+        proc = subprocess.run(
+            cc_cmd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        print(proc.stdout)
+        print(proc.stderr, file=sys.stderr)
+        if proc.returncode != 0:
+            # Keep stdout/stderr for debugging
+            print(proc.stdout)
+            print(proc.stderr, file=sys.stderr)
+            raise subprocess.CalledProcessError(proc.returncode, cc_cmd)
+
+        if report_regs:
+            # nvcc/ptxas messages are not consistently routed; parse both.
+            combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            report = _parse_ptxas_register_report(combined)
+            if report:
+                smem_static = _dump_static_smem_bytes_for_functions(
+                    so_path=so_path, nvcc_path=cc
+                )
+                regprobe = {k: v for k, v in report.items() if "__mirage_regprobe_" in k}
+                to_print = regprobe if regprobe else report
+                title = "Per-task resource usage (ptxas + inferred dynamic smem):" if regprobe else "Per-task wrapper register usage (ptxas):"
+                print(title)
+                for name, regs in sorted(to_print.items(), key=lambda x: (-x[1], x[0])):
+                    static_b = smem_static.get(name, None)
+                    m = re.search(r"_dsmem(\d+|U)\b", name)
+                    dyn_used = None
+                    if m:
+                        dyn_used = -1 if m.group(1) == "U" else int(m.group(1))
+                    dyn_str = "?" if dyn_used is None or dyn_used < 0 else str(dyn_used)
+                    static_str = "?" if static_b is None else str(static_b)
+                    total_str = "?"
+                    if static_b is not None and dyn_used is not None and dyn_used >= 0:
+                        total_str = str(static_b + dyn_used)
+                    print(f"  {name}: regs={regs}; smem_dynamic_used={dyn_str}; smem_static={static_str}; smem_total={total_str}")
+                if output_dir is not None:
+                    try:
+                        report_path = os.path.join(output_dir, f"reg_report_rank{self.mpi_rank}.txt")
+                        with open(report_path, "w") as rf:
+                            for name, regs in sorted(to_print.items(), key=lambda x: (-x[1], x[0])):
+                                static_b = smem_static.get(name, -1)
+                                m = re.search(r"_dsmem(\d+|U)\b", name)
+                                dyn_used = -1
+                                if m:
+                                    dyn_used = -1 if m.group(1) == "U" else int(m.group(1))
+                                total = static_b + dyn_used if static_b >= 0 and dyn_used >= 0 else -1
+                                rf.write(f"{name}\tregs={regs}\tsmem_dynamic_used={dyn_used}\tsmem_static={static_b}\tsmem_total={total}\n")
+                        print(f"Wrote register report to: {report_path}")
+                    except Exception as e:
+                        print(f"Warning: failed to write reg report file: {e}")
+            else:
+                # Provide a helpful hint and a fallback summary.
+                print("No per-task wrapper register report found in ptxas output.")
+                fallback = _parse_ptxas_register_report(combined, only_wrappers=False)
+                if fallback:
+                    print("Top functions by register usage (ptxas):")
+                    for name, regs in sorted(fallback.items(), key=lambda x: (-x[1], x[0]))[:20]:
+                        print(f"  {name}: {regs} regs")
+
+        if output_dir is not None:
+            try:
+                so_out = os.path.join(output_dir, f"megakernel_rank{self.mpi_rank}.so")
+                shutil.copy(so_path, so_out)
+                print(f"Wrote megakernel shared library to: {so_out}")
+                so_path = so_out
+            except Exception as e:
+                print(f"Warning: failed to copy megakernel .so to output_dir: {e}")
 
         import importlib.util
+
+        so_path = _maybe_patch_megakernel_so(
+            so_path,
+            reg=patch_worker_kernel_reg_kw,
+            kernel_substr="worker_kernel",
+            dump_dir=output_dir if output_dir is not None else None,
+        )
 
         spec = importlib.util.spec_from_file_location("__mirage_launcher", so_path)
         mod = importlib.util.module_from_spec(spec)
@@ -1453,15 +1621,13 @@ class PersistentKernel:
         self.launch_func()
         if self.profiler_tensor is not None:
             from .profiler_persistent import export_to_perfetto_trace
-            
+
             if self.trace_name:
                 trace_name = self.trace_name + ".perfetto-trace"
             else:
                 trace_name = f"mirage_{self.mpi_rank}.perfetto-trace"
 
-            export_to_perfetto_trace(
-                self.profiler_tensor, trace_name
-            )
+            export_to_perfetto_trace(self.profiler_tensor, trace_name)
 
     def __del__(self):
         if not self.__finalized__:
@@ -1472,3 +1638,552 @@ class PersistentKernel:
         if self._is_compiled:
             self.finalize_func()
         self.__finalized__ = True
+
+
+def _inject_noinline_task_wrappers(cuda_code: str) -> str:
+    """
+    Transform generated CUDA code by wrapping each `_execute_task` branch into a
+    dedicated `__device__ __noinline__` wrapper function, so ptxas can report
+    registers per task/variant more reliably.
+
+    Expected generated pattern (example):
+      __device__ __forceinline__
+      void _execute_task(...) {
+        if (task_desc->task_type == TASK_X && task_desc->variant_id == 0) {
+          kernel::foo(...);
+        }
+        else if (...) { ... }
+      }
+    """
+    signature = "__device__ __forceinline__\nvoid _execute_task("
+    start = cuda_code.find(signature)
+    if start < 0:
+        # Try a slightly different whitespace format
+        signature = "__device__ __forceinline__\nvoid _execute_task"
+        start = cuda_code.find(signature)
+        if start < 0:
+            raise ValueError("Could not find _execute_task definition in generated CUDA code")
+
+    # Find the opening brace of the function
+    brace_open = cuda_code.find("{", start)
+    if brace_open < 0:
+        raise ValueError("Malformed _execute_task: missing '{'")
+
+    # Find matching closing brace by brace counting
+    i = brace_open
+    depth = 0
+    while i < len(cuda_code):
+        ch = cuda_code[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                brace_close = i
+                break
+        i += 1
+    else:
+        raise ValueError("Malformed _execute_task: missing closing '}'")
+
+    prefix = cuda_code[:start]
+    func_text = cuda_code[start : brace_close + 1]
+    suffix = cuda_code[brace_close + 1 :]
+
+    # Make `_execute_task` itself noinline to avoid it being merged into callers
+    # and to improve ptxas' per-function reporting stability.
+    func_text = func_text.replace("__device__ __forceinline__", "__device__ __noinline__", 1)
+
+    # Extract branches in the if/else-if chain
+    branch_re = re.compile(
+        r"(?:^|\n)\s*(?:else\s+)?if\s*\(\s*task_desc->task_type\s*==\s*(TASK_[A-Z0-9_]+)\s*&&\s*task_desc->variant_id\s*==\s*(\d+)\s*\)\s*\{",
+        re.M,
+    )
+    branches = list(branch_re.finditer(func_text))
+    if not branches:
+        raise ValueError("No task branches found in _execute_task")
+
+    wrappers: list[str] = []
+    probes: list[str] = []
+    replacements: list[tuple[int, int, str]] = []
+
+    for m in branches:
+        task_type = m.group(1)
+        variant_id = int(m.group(2))
+        block_start = m.end()  # after '{'
+        # Find end of this branch block by brace counting starting at this '{'
+        j = block_start
+        depth2 = 1
+        while j < len(func_text):
+            if func_text[j] == "{":
+                depth2 += 1
+            elif func_text[j] == "}":
+                depth2 -= 1
+                if depth2 == 0:
+                    block_end = j  # position of matching '}'
+                    break
+            j += 1
+        else:
+            raise ValueError(f"Unmatched braces in branch {task_type} v{variant_id}")
+
+        original_block = func_text[block_start:block_end]
+        dyn_smem = _estimate_dynamic_smem_bytes_from_branch(original_block)
+        dyn_smem_suffix = f"_dsmem{dyn_smem}" if dyn_smem >= 0 else "_dsmemU"
+        wrapper_name = f"__mirage_task_{task_type}_v{variant_id}{dyn_smem_suffix}"
+        probe_name = f"__mirage_regprobe_{task_type}_v{variant_id}{dyn_smem_suffix}"
+        wrappers.append(
+            "\n".join(
+                [
+                    f"__device__ __noinline__ void {wrapper_name}(TaskDesc const* task_desc, RuntimeConfig const &runtime_config) {{",
+                    "  __shared__ int __mirage_task_done;",
+                    original_block.rstrip(),
+                    "}",
+                    "",
+                ]
+            )
+        )
+        probes.append(
+            "\n".join(
+                [
+                    f'extern "C" __global__ __launch_bounds__(256) void {probe_name}(TaskDesc const* task_desc, RuntimeConfig const* runtime_config) {{',
+                    f"  {wrapper_name}(task_desc, *runtime_config);",
+                    "}",
+                    "",
+                ]
+            )
+        )
+
+        # Replace the original block body with a call to wrapper (keep braces)
+        replacement_body = f"\n      {wrapper_name}(task_desc, runtime_config);\n"
+        replacements.append((block_start, block_end, replacement_body))
+
+    # Apply replacements from back to front
+    new_func_text = func_text
+    for a, b, rep in sorted(replacements, key=lambda x: x[0], reverse=True):
+        new_func_text = new_func_text[:a] + rep + new_func_text[b:]
+
+    injected = prefix + "\n".join(wrappers) + "\n" + "\n".join(probes) + "\n" + new_func_text + suffix
+    return injected
+
+
+def _parse_ptxas_register_report(stderr: str, only_wrappers: bool = True) -> dict[str, int]:
+    """
+    Parse ptxas output and return {demangled_name: regs} for injected wrappers.
+    This relies on ptxas 'Function properties for <mangled>' followed by 'Used N registers'.
+    """
+    current_fn = None
+    fn_to_regs: dict[str, int] = {}
+    fn_re = re.compile(r"ptxas info\s*: Function properties for (.+)")
+    entry_re = re.compile(r"ptxas info\s*: Compiling entry function '([^']+)'")
+    regs_re = re.compile(r"ptxas info\s*: Used\s+(\d+)\s+registers\b")
+    for line in stderr.splitlines():
+        m = fn_re.search(line)
+        if m:
+            current_fn = m.group(1).strip().strip("'\"")
+            continue
+        m = entry_re.search(line)
+        if m:
+            current_fn = m.group(1).strip().strip("'\"")
+            continue
+        m = regs_re.search(line)
+        if m and current_fn:
+            fn_to_regs[current_fn] = int(m.group(1))
+            current_fn = None
+
+    if not fn_to_regs:
+        return {}
+
+    # Demangle if possible
+    try:
+        proc = subprocess.run(
+            ["c++filt"],
+            input="\n".join(fn_to_regs.keys()),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        demangled = proc.stdout.splitlines()
+        if len(demangled) == len(fn_to_regs):
+            mapping = dict(zip(fn_to_regs.keys(), demangled))
+        else:
+            mapping = {k: k for k in fn_to_regs.keys()}
+    except FileNotFoundError:
+        mapping = {k: k for k in fn_to_regs.keys()}
+
+    out: dict[str, int] = {}
+    for mangled, regs in fn_to_regs.items():
+        name = mapping.get(mangled, mangled)
+        if only_wrappers:
+            # Prefer regprobe kernels since they are entry functions and ptxas
+            # reliably prints register usage for them.
+            if "__mirage_regprobe_" in name or "__mirage_task_" in name:
+                out[name] = regs
+        else:
+            out[name] = regs
+    return out
+
+
+def _estimate_dynamic_smem_bytes_from_branch(branch_body: str) -> int:
+    """
+    Best-effort inference of a task's dynamic shared memory usage (bytes) by
+    parsing the kernel call in the _execute_task branch and mirroring the
+    constexpr offset calculations in the corresponding task implementation.
+
+    Returns:
+      - >=0: dynamic shared bytes used (by offsets into extern __shared__)
+      - -1: unknown
+    """
+    call_re = re.compile(r"kernel::([A-Za-z0-9_]+)\s*<([^>]*)>\s*\(")
+    m = call_re.search(branch_body)
+    if not m:
+        return -1
+    fn = m.group(1)
+    targs = [x.strip() for x in m.group(2).split(",") if x.strip()]
+
+    def type_size(type_tok: str) -> int | None:
+        t = type_tok.replace(" ", "")
+        if "bfloat16" in t:
+            return 2
+        if t in ("half", "__half") or "float16" in t:
+            return 2
+        if "float" == t or "float32" in t:
+            return 4
+        return None
+
+    ints: list[int] = []
+    for tok in targs[1:]:
+        if tok.isdigit():
+            ints.append(int(tok))
+    if not targs:
+        return -1
+    sz = type_size(targs[0])
+
+    # Kernels with no extern shared
+    if fn in (
+        "embedding_kernel",
+        "silu_mul_task_impl",
+        # Hopper variants
+        "embedding_kernel_hopper",
+        "silu_mul_task_impl_hopper",
+    ):
+        return 0
+
+    if fn == "linear_kernel":
+        # <T, BATCH_SIZE, OUTPUT_SIZE, REDUCTION_SIZE, O_STRIDE, PIPE_MAX=3>
+        if sz is None or len(ints) < 4:
+            return -1
+        batch, out_size, red_size = ints[0], ints[1], ints[2]
+        pipe_max = ints[4] if len(ints) >= 5 else 3
+        tile = 128
+        forloop = red_size // tile
+        adj_pipe = pipe_max if pipe_max < forloop else forloop
+        out_atom = out_size if out_size <= 64 else 64
+        zero = sz * 64
+        shared_input = sz * batch * adj_pipe * tile
+        shared_weight = sz * tile * adj_pipe * out_atom
+        shared_output = sz * batch * out_atom
+        return zero + shared_input + shared_weight + shared_output
+
+    if fn in ("linear_kernel_hopper", "linear_swapAB_kernel_hopper"):
+        # Mirror the constexpr shared memory layout in:
+        # - include/mirage/persistent_kernel/tasks/hopper/linear_hopper.cuh
+        # - include/mirage/persistent_kernel/tasks/hopper/linear_swapAB_hopper.cuh
+        #
+        # Common template args prefix:
+        #   <T, BATCH_SIZE, OUTPUT_SIZE, REDUCTION_SIZE, Kstages, ...>
+        if sz is None or len(ints) < 4:
+            return -1
+        batch, out_size, red_size, kstages = ints[0], ints[1], ints[2], ints[3]
+
+        def align_up(x: int, a: int) -> int:
+            return ((x + a - 1) // a) * a
+
+        # TaskRegister uses `void` for the residual TMA type when residual is
+        # not present; the kernel checks via std::is_void.
+        has_residual = any(tok.replace(" ", "") == "void" for tok in targs)
+
+        # Both Hopper linear kernels are configured with a 128-wide K tile
+        # (unless the reduction dim is smaller).
+        tile_size = red_size if red_size < 128 else 128
+
+        if fn == "linear_kernel_hopper":
+            smem_m_size = batch
+            output_atom_size = out_size if out_size <= 256 else 256
+
+            shared_input_off = 0
+            shared_weight_off = align_up(
+                shared_input_off + sz * kstages * smem_m_size * tile_size, 1024
+            )
+            shared_residual_off = align_up(
+                shared_weight_off + sz * kstages * tile_size * output_atom_size, 1024
+            )
+            shared_mm_out_off = (
+                align_up(
+                    shared_residual_off + sz * smem_m_size * output_atom_size * kstages,
+                    1024,
+                )
+                if has_residual
+                else shared_residual_off
+            )
+            shared_input_barrier_off = align_up(
+                shared_mm_out_off + sz * smem_m_size * output_atom_size * kstages, 16
+            )
+            shared_weight_barrier_off = align_up(
+                shared_input_barrier_off + 8 * kstages, 8
+            )
+            shared_residual_barrier_off = align_up(
+                shared_weight_barrier_off + 8 * kstages, 8
+            )
+            shared_compute_done_off = (
+                align_up(shared_residual_barrier_off + 8 * kstages, 8)
+                if has_residual
+                else shared_residual_barrier_off
+            )
+            shared_residual_done_off = align_up(shared_compute_done_off + 8 * kstages, 8)
+            return shared_residual_done_off + 8 * kstages
+
+        # linear_swapAB_kernel_hopper
+        smem_m_size = 8 if batch <= 8 else 16
+        output_atom_size = 64
+        shared_input_off = 0
+        shared_weight_off = align_up(
+            shared_input_off + sz * kstages * smem_m_size * tile_size, 1024
+        )
+        shared_residual_off = align_up(
+            shared_weight_off + sz * kstages * tile_size * output_atom_size, 1024
+        )
+        shared_mm_out_off = (
+            align_up(
+                shared_residual_off + sz * smem_m_size * output_atom_size * kstages,
+                1024,
+            )
+            if has_residual
+            else shared_residual_off
+        )
+        shared_input_barrier_off = align_up(
+            shared_mm_out_off + sz * smem_m_size * output_atom_size * kstages, 8
+        )
+        shared_weight_barrier_off = align_up(shared_input_barrier_off + 8 * kstages, 8)
+        shared_residual_barrier_off = align_up(shared_weight_barrier_off + 8 * kstages, 8)
+        shared_compute_done_off = (
+            align_up(shared_residual_barrier_off + 8 * kstages, 8)
+            if has_residual
+            else shared_residual_barrier_off
+        )
+        shared_residual_done_off = align_up(shared_compute_done_off + 8 * kstages, 8)
+        return shared_residual_done_off + 8 * kstages
+
+    if fn == "rms_norm_hopper_impl":
+        # include/mirage/persistent_kernel/tasks/hopper/rmsnorm_hopper.cuh
+        # <T, BATCH_SIZE, HIDDEN_DIM, NUM_THREADS=256>
+        if sz is None or len(ints) < 2:
+            return -1
+        hidden_dim = ints[1]
+        num_threads = ints[2] if len(ints) >= 3 else 256
+        num_warps = num_threads // 32
+        return 3 * sz * hidden_dim + 4 * num_warps
+
+    if fn == "multitoken_paged_attention_hopper_impl":
+        # include/mirage/persistent_kernel/tasks/hopper/multitoken_paged_attention_hopper.cuh
+        # Template prefix:
+        # <T, NUM_QO_HEADS, NUM_KV_HEADS, NUM_QO_GROUPS, KV_CACHE_STRIDE, QKV_STRIDE,
+        #  O_STRIDE, HEAD_DIM, SEQ_LEN, MAX_SEQ_LEN, PAGE_SIZE, MAX_TOKENS=8, ...>
+        if sz is None or len(ints) < 10:
+            return -1
+        num_qo_heads = ints[0]
+        num_kv_heads = ints[1]
+        head_dim = ints[6]
+        max_seq_len = ints[8]
+        page_size = ints[9]
+        max_tokens = ints[10] if len(ints) >= 11 else 8
+        if num_kv_heads == 0 or num_qo_heads % num_kv_heads != 0:
+            return -1
+
+        def align_up(x: int, a: int) -> int:
+            return ((x + a - 1) // a) * a
+
+        num_qo_per_kv = num_qo_heads // num_kv_heads
+        kv_tile = 64
+        num_threads = 256  # include/mirage/persistent_kernel/tasks/common/worker_config.h
+        kstages = 2
+        mma_iters_m = (max_tokens * num_qo_per_kv + 63) // 64
+
+        s_q_off = 0
+        s_q_size = sz * max_tokens * num_qo_per_kv * head_dim
+        s_k_off = align_up(s_q_off + s_q_size, 1024)
+        s_k_size = sz * kv_tile * head_dim
+        s_kbuf_off = align_up(s_k_off + s_k_size, 1024)
+        s_v_off = align_up(s_kbuf_off + s_k_size, 1024)
+        s_vbuf_off = align_up(s_v_off + s_k_size, 1024)
+
+        s_q_norm_off = align_up(s_vbuf_off + s_k_size, 4)
+        s_q_norm_size = 4 * 4
+        s_k_norm_off = s_q_norm_off + s_q_norm_size
+        s_k_norm_size = 4 * 4
+
+        s_m_off = s_k_norm_off + s_k_norm_size
+        s_m_size = 4 * mma_iters_m * num_threads * 2
+        s_d_off = s_m_off + s_m_size
+        s_d_size = 4 * mma_iters_m * num_threads * 2
+        s_o_buf_off = s_d_off + s_d_size
+        s_o_buf_size = 4 * mma_iters_m * num_threads * 64
+
+        s_q_barrier_off = align_up(s_o_buf_off + s_o_buf_size, 8)
+        s_q_barrier_size = 8 * kstages
+        s_k_barrier_off = align_up(s_q_barrier_off + s_q_barrier_size, 8)
+        s_k_barrier_size = 8 * kstages
+        s_v_barrier_off = align_up(s_k_barrier_off + s_k_barrier_size, 8)
+        s_v_barrier_size = 8 * kstages
+        s_compute_done_off = align_up(s_v_barrier_off + s_v_barrier_size, 8)
+        s_compute_done_size = 8 * kstages
+
+        # Total excludes `S_O_OFFSET` since it reuses memory.
+        return s_compute_done_off + s_compute_done_size
+
+    if fn == "rms_norm_impl":
+        # <T, BATCH_SIZE, HIDDEN_DIM>, BATCH_SIZE is asserted == 1 in code.
+        if sz is None or len(ints) < 2:
+            return -1
+        hidden = ints[1]
+        num_warps = 4  # NUM_THREADS=128
+        return 3 * sz * hidden + 4 * num_warps
+
+    if fn in (
+        "argmax_partial_kernel",
+        "argmax_reduce_kernel",
+        "argmax_partial_sm100_kernel",
+        "argmax_reduce_sm100_kernel",
+    ):
+        # Ampere: tasks/ampere/argmax.cuh
+        # Blackwell: tasks/blackwell/argmax_sm100.cuh
+        #
+        # Both use a block reduce that stores one (val, idx) pair per warp in
+        # dynamic shared memory with the same high-level layout:
+        #   extern __shared__ char smem[];
+        #   smem_idxs = align_up(smem, 128);
+        #   smem_vals = reinterpret_cast<T*>(smem_idxs + 32);
+        #
+        # So the dynamic shared footprint is:
+        #   max_align_slack(127B) + 32 * (8B idx + sizeof(T) val)
+        if sz is None:
+            return -1
+        max_warps = 32
+        align_slack = 127
+        return align_slack + max_warps * (8 + sz)
+
+    if fn == "multitoken_paged_attention_task_impl":
+        # <T, NUM_QO_HEADS, NUM_KV_HEADS, KV_CACHE_STRIDE, QKV_STRIDE, O_STRIDE,
+        #  HEAD_DIM, MAX_SEQ_LEN, PAGE_SIZE, MAX_TOKENS=8>
+        if sz is None or len(ints) < 8:
+            return -1
+        num_qo, num_kv = ints[0], ints[1]
+        head_dim = ints[5]
+        max_seq_len = ints[6]
+        page_size = ints[7]
+        max_tokens = ints[8] if len(ints) >= 9 else 8
+        if num_kv == 0 or num_qo % num_kv != 0:
+            return -1
+        num_qo_per_kv = num_qo // num_kv
+        num_q = max_tokens * num_qo_per_kv
+
+        def align4(x: int) -> int:
+            return (x + 3) & ~3
+
+        zero = sz * 8
+        s_q_size = sz * max_tokens * num_qo_per_kv * head_dim
+        if (max_tokens * num_qo) <= 16:
+            kv_tile = 64
+            s_k_size = sz * kv_tile * head_dim
+            s_q_off = zero
+            s_k_off = s_q_off + s_q_size
+            s_kbuf_off = s_k_off + s_k_size
+            s_v_off = s_kbuf_off + s_k_size
+            s_vbuf_off = s_v_off + s_k_size
+            s_q_norm_off = align4(s_vbuf_off + s_k_size)
+            s_q_norm_size = 4 * 4
+            s_k_norm_off = s_q_norm_off + s_q_norm_size
+            s_k_norm_size = 4 * 4
+            mma_iters_m = (num_q + 15) // 16
+            s_m_size = 4 * mma_iters_m * 128 * 2
+            s_d_size = 4 * mma_iters_m * 128 * 2
+            s_o_buf_size = 4 * mma_iters_m * 128 * 64
+            s_m_off = zero
+            s_d_off = s_m_off + s_m_size
+            s_o_buf_off = s_d_off + s_d_size
+            s_o_off = s_o_buf_off + s_o_buf_size
+            s_o_size = s_q_size
+            total1 = s_o_off + s_o_size
+            total2 = s_k_norm_off + s_k_norm_size
+            return total1 if total1 > total2 else total2
+        elif (max_tokens * num_qo) <= 64:
+            kv_tile = 128
+            s_k_size = sz * kv_tile * head_dim
+            s_q_off = zero
+            s_k_off = s_q_off + s_q_size
+            s_kbuf_off = s_k_off + s_k_size
+            s_v_off = s_kbuf_off + s_k_size
+            s_vbuf_off = s_v_off + s_k_size
+            s_q_norm_off = align4(s_vbuf_off + s_k_size)
+            s_q_norm_size = 4 * 4
+            s_k_norm_off = s_q_norm_off + s_q_norm_size
+            s_k_norm_size = 4 * 4
+            global_iters_m = (num_q + 64 - 1) // 64
+            s_m_size = 4 * global_iters_m * 128 * 2
+            s_d_size = 4 * global_iters_m * 128 * 2
+            s_o_buf_size = 4 * global_iters_m * 128 * 64
+            s_m_off = zero
+            s_d_off = s_m_off + s_m_size
+            s_o_buf_off = s_d_off + s_d_size
+            total1 = s_o_buf_off + s_o_buf_size
+            total2 = s_k_norm_off + s_k_norm_size
+            return total1 if total1 > total2 else total2
+        return -1
+
+    return -1
+
+
+def _dump_static_smem_bytes_for_functions(so_path: str, nvcc_path: str) -> dict[str, int]:
+    """
+    Use cuobjdump --dump-resource-usage to fetch per-entry-function static shared memory usage.
+    Returns {function_name: static_shared_bytes}.
+    """
+    if not so_path or not os.path.exists(so_path):
+        return {}
+    cuobjdump = None
+    if nvcc_path:
+        candidate = os.path.join(os.path.dirname(nvcc_path), "cuobjdump")
+        if os.path.exists(candidate):
+            cuobjdump = candidate
+    if cuobjdump is None:
+        cuobjdump = shutil.which("cuobjdump")
+    if cuobjdump is None:
+        return {}
+
+    try:
+        out = subprocess.check_output(
+            [cuobjdump, "--dump-resource-usage", so_path],
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+    except Exception:
+        return {}
+
+    # Parse blocks like:
+    #  Function __mirage_regprobe_TASK_X_v0:
+    #   REG:.. STACK:.. SHARED:0 LOCAL:0 ...
+    fn_re = re.compile(r"^\s*Function\s+([^\s:]+)\s*:\s*$")
+    shared_re = re.compile(r"SHARED:(\d+)")
+    current = None
+    fn_to_shared: dict[str, int] = {}
+    for line in out.splitlines():
+        m = fn_re.match(line)
+        if m:
+            current = m.group(1)
+            continue
+        if current:
+            m = shared_re.search(line)
+            if m:
+                fn_to_shared[current] = int(m.group(1))
+                current = None
+
+    return fn_to_shared

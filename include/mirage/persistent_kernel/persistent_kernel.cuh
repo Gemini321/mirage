@@ -463,10 +463,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
   // worker_queues: 2 * 8 = 16 B
   // remaining: 3016 B
 
-  constexpr int TASK_DESCS_BUFFER_LENGTH = std::min(
+  constexpr int kTaskDescsBufferLengthBySmem =
       (mirage::runtime::WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE - 56) /
-          (int)(sizeof(TaskDesc) + sizeof(TaskId)),
-      16);
+      (int)(sizeof(TaskDesc) + sizeof(TaskId));
+  constexpr int TASK_DESCS_BUFFER_LENGTH =
+      (kTaskDescsBufferLengthBySmem < 16) ? kTaskDescsBufferLengthBySmem : 16;
   __shared__ TaskDesc task_descs[TASK_DESCS_BUFFER_LENGTH];
   __shared__ TaskId task_ids[TASK_DESCS_BUFFER_LENGTH];
   __shared__ TaskId *worker_queues[2];
@@ -564,8 +565,10 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
       // Load task descs
       static_assert(sizeof(TaskDesc) % 16 == 0);
       constexpr int TASK_SIZE = sizeof(TaskDesc) / 16; // 128b copy-async
+      // for (int i = threadIdx.x; i < num_loaded_tasks * TASK_SIZE;
+      //      i += blockDim.x) {
       for (int i = threadIdx.x; i < num_loaded_tasks * TASK_SIZE;
-           i += blockDim.x) {
+           i += WORKER_NUM_THREADS) {
         int task_idx = i / TASK_SIZE;
         int offset = i % TASK_SIZE;
         load_smem(reinterpret_cast<char *>(task_descs) + i * 16,
@@ -990,8 +993,9 @@ __global__ __launch_bounds__(WORKER_NUM_THREADS,
   }
 }
 
-__global__ __launch_bounds__(WORKER_NUM_THREADS,
-                             1) void worker_kernel(RuntimeConfig config) {
+// __global__ __launch_bounds__(WORKER_NUM_THREADS,
+//                              1) void worker_kernel(RuntimeConfig config) {
+__global__ __maxnreg__(224) void worker_kernel(RuntimeConfig config) {
   worker_checker(config);
   execute_worker(config);
 }
@@ -1283,12 +1287,18 @@ extern "C" void launch_persistent_kernel() {
   if (global_runtime_config.split_worker_scheduler) {
     printf("worker kernel & scheduler kernel\n");
     printf("smem size: %d\n", MAX_DYNAMIC_SHARED_MEMORY_SIZE);
+    // NOTE: Hopper task implementations assume a fixed worker group size
+    // (WORKER_NUM_THREADS) for wg_sync<WORKER_NUM_THREADS>(...), and some tasks
+    // use dynamic shared memory layouts sized for that group. Launching with a
+    // larger blockDim.x is undefined unless *all* task code paths are audited
+    // for block-wide sync and shared-memory indexing assumptions.
+    printf("worker threads: %d, scheduler threads: %d\n", WORKER_NUM_THREADS * 2, 32);
 
     // The split kernel does not support NVSHMEM because
     // nvshmemx_collective_launch launches kernels sequentially, which blocks
     // the interaction between the worker kernel and the scheduler kernel
     worker_kernel<<<dim3(global_runtime_config.num_workers, 1, 1),
-                    dim3(WORKER_NUM_THREADS, 1, 1),
+                    dim3(WORKER_NUM_THREADS * 2, 1, 1),
                     MAX_DYNAMIC_SHARED_MEMORY_SIZE /*smem*/,
                     global_runtime_config.worker_stream>>>(
         global_runtime_config);
@@ -1299,7 +1309,12 @@ extern "C" void launch_persistent_kernel() {
                        global_runtime_config.scheduler_stream>>>(
         global_runtime_config);
 
-    cudaError_t err = cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      printf("CUDA kernel launch error: %s\n", cudaGetErrorString(err));
+    }
+    err = cudaDeviceSynchronize();
+    // cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
       printf("CUDA kernel launch error: %s\n", cudaGetErrorString(err));
     }

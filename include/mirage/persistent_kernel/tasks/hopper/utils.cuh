@@ -15,6 +15,9 @@
 
 #pragma once
 
+#define USE_DYNAMIC_WORKER 1
+#define WORKER_NUM_THREADS 256
+
 // decrease register files in a wg
 template <uint32_t RegCount>
 static __device__ __forceinline__ void wg_decrease_regs() {

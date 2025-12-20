@@ -28,6 +28,9 @@
 #include "tma.cuh"
 #include "utils.cuh"
 #include "wgmma.cuh"
+#include <cutlass/arch/barrier.h>
+#include <cutlass/arch/reg_reconfig.h>
+#include <cute/arch/cluster_sm90.hpp>
 #define USE_TMA_Q 0
 namespace kernel {
 
@@ -133,7 +136,11 @@ __device__ __forceinline__ void multitoken_paged_attention_hopper_impl(
     }
   }
 
+#ifdef USE_DYNAMIC_WORKER
+  wg_sync<WORKER_NUM_THREADS>(2);
+#else
   __syncthreads();
+#endif
 
   T const *__restrict__ d_q =
       reinterpret_cast<T const *>(qkv_ptr) + first_token_pos * QKV_STRIDE;
@@ -281,7 +288,11 @@ __device__ __forceinline__ void multitoken_paged_attention_hopper_impl(
       initialize_barrier(compute_done[i], 1);
     }
   }
+#ifdef USE_DYNAMIC_WORKER
+  wg_sync<WORKER_NUM_THREADS>(2);
+#else
   __syncthreads();
+#endif
 
   if (warpgroup_id == NUM_WARPGROUPS - 1) {
     // prefetch

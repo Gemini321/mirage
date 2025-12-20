@@ -14,6 +14,7 @@
  */
 #pragma once
 #include "tasks/common/common_header.cuh"
+#include "tasks/hopper/utils.cuh"
 namespace kernel {
 template <typename T>
 __device__ __forceinline__ void warp_reduce_max_idx(T &val, long long &idx) {
@@ -47,14 +48,18 @@ __device__ __forceinline__ void block_reduce_max_idx(T &val, long long &idx) {
     smem_idxs[my_warp_id] = idx;
   }
 
+#ifdef USE_DYNAMIC_WORKER
+  wg_sync<WORKER_NUM_THREADS>(2);
+#else
   __syncthreads();
+#endif
 
   // Only thread 0 holds the final result
   if (my_warp_id == 0) {
     T block_max_val = T(-inf);
     long long block_max_idx = -1;
 
-    int num_warps = (blockDim.x + 31) >> log2_constexpr(NUM_THREADS_PER_WARP);
+    int num_warps = (WORKER_NUM_THREADS + 31) >> log2_constexpr(NUM_THREADS_PER_WARP);
     if (my_lane_id < num_warps) {
       block_max_val = smem_vals[my_lane_id];
       block_max_idx = smem_idxs[my_lane_id];
