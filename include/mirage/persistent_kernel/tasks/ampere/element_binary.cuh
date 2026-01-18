@@ -25,7 +25,8 @@ static __device__ __forceinline__ void
   // static_assert(SMEM_SRC1::COL == 1);
   // constexpr int BLOCK_SIZE = SMEM_SRC0::COL / SMEM_SRC1::COL;
 
-  for (int elem_idx = threadIdx.x; elem_idx < SMEM_DST::size();
+  int const tid = worker_thread_id();
+  for (int elem_idx = tid; elem_idx < SMEM_DST::size();
        elem_idx += NUM_THREADS) {
     int col = elem_idx % SMEM_DST::COL;
     int row = elem_idx / SMEM_DST::COL;
@@ -36,7 +37,8 @@ static __device__ __forceinline__ void
 template <typename SMEM_DST, typename SMEM_SRC0, typename SMEM_SRC1>
 __device__ __forceinline__ void
     mul(SMEM_DST dst, SMEM_SRC0 src0, SMEM_SRC1 src1) {
-  for (int elem_idx = threadIdx.x; elem_idx < SMEM_DST::size();
+  int const tid = worker_thread_id();
+  for (int elem_idx = tid; elem_idx < SMEM_DST::size();
        elem_idx += NUM_THREADS) {
     dst.at(elem_idx) = src0.at(elem_idx) * src1.at(elem_idx);
   }
@@ -49,7 +51,8 @@ static __device__ __forceinline__ void
   // src0: [BATCH_SIZE, TILE_SIZE], src1: [1, TILE_SIZE]
   // dst = src0 * broadcast(src1)
 
-  for (int elem_idx = threadIdx.x; elem_idx < SMEM_DST::size();
+  int const tid = worker_thread_id();
+  for (int elem_idx = tid; elem_idx < SMEM_DST::size();
        elem_idx += NUM_THREADS) {
     int col = elem_idx % SMEM_DST::COL;
     int row = elem_idx / SMEM_DST::COL;

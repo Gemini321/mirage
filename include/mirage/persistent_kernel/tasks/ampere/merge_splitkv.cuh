@@ -38,7 +38,8 @@ __device__ __forceinline__ void
                   int16_t request_id,
                   void *output,
                   int merge_task_offset) {
-  if (threadIdx.x >= 128) {
+  int const tid = worker_thread_id();
+  if (tid >= 128) {
     return;
   }
   T const *o_ptr = reinterpret_cast<T const *>(o);
@@ -72,8 +73,8 @@ __device__ __forceinline__ void
   constexpr int VAL_PER_THREAD = HEAD_DIM / THREADS_PER_TOKEN;
   constexpr int num_groups = NUM_THREADS / THREADS_PER_TOKEN;
 
-  int thread_in_group = threadIdx.x % THREADS_PER_TOKEN;
-  int group_id = threadIdx.x / THREADS_PER_TOKEN;
+  int thread_in_group = tid % THREADS_PER_TOKEN;
+  int group_id = tid / THREADS_PER_TOKEN;
   int head_partition = thread_in_group;
 
   // let 16 threads to process one head_dim

@@ -89,10 +89,16 @@ __device__ __forceinline__ void linear_kernel(void const *input_ptr,
   constexpr int log2_NUM_WARPS_N = log2_constexpr(NUM_WARPS_N);
   constexpr int log2_NUM_ITERS_K = log2_constexpr(NUM_ITERS_K);
 
-  int warp_idx = warp_id();
+  // This kernel is written for a 128-thread "worker group" and is sometimes
+  // launched as 2 groups (256 threads) where each group executes an
+  // independent task. Use group-local thread/warp/lane IDs so group1 does not
+  // compute out-of-range indices (and corrupt SMEM / skip output stores).
+  int const group_id = threadIdx.x / NUM_THREADS;
+  int const tid = threadIdx.x & (NUM_THREADS - 1);
+  int warp_idx = tid >> 5;
   int warp_row = warp_idx >> log2_NUM_WARPS_N;
   int warp_col = warp_idx & (NUM_WARPS_N - 1);
-  int lane_idx = lane_id();
+  int lane_idx = tid & 31;
 
   T const *__restrict__ d_input = static_cast<T const *>(input_ptr);
   T const *__restrict__ d_weight = static_cast<T const *>(weight_ptr);
@@ -133,16 +139,24 @@ __device__ __forceinline__ void linear_kernel(void const *input_ptr,
       SHARED_WEIGHT_BUFFER_OFFSET +
       sizeof(T) * TILE_SIZE * ADJUSTED_PIPE_MAX * OUTPUT_ATOM_SIZE;
 
+  // Partition dynamic shared memory by group so two independent groups can run
+  // concurrently inside the same CTA without races.
+  constexpr size_t SMEM_PER_GROUP_RAW =
+      SHARED_OUTPUT_OFFSET + sizeof(T) * BATCH_SIZE * OUTPUT_ATOM_SIZE;
+  constexpr size_t SMEM_PER_GROUP =
+      ((SMEM_PER_GROUP_RAW + 15) / 16) * 16; // keep 16B alignment
+  char *smem_g = smem + static_cast<size_t>(group_id) * SMEM_PER_GROUP;
+
   // zero buffer
-  T *zero_buf = (T *)(smem + ZERO_BUFFER_OFFSET);
+  T *zero_buf = (T *)(smem_g + ZERO_BUFFER_OFFSET);
   vec_zero_t<T, 8>::fill_zero(zero_buf);
 
   // copy
-  T *shared_input_buffer = (T *)(smem + SHARED_INPUT_BUFFER_OFFSET);
-  T *shared_weight_buffer = (T *)(smem + SHARED_WEIGHT_BUFFER_OFFSET);
+  T *shared_input_buffer = (T *)(smem_g + SHARED_INPUT_BUFFER_OFFSET);
+  T *shared_weight_buffer = (T *)(smem_g + SHARED_WEIGHT_BUFFER_OFFSET);
 
   // output
-  T *shared_output = (T *)(smem + SHARED_OUTPUT_OFFSET);
+  T *shared_output = (T *)(smem_g + SHARED_OUTPUT_OFFSET);
 
   // define the swizzle mode
   using ZeroBufferSmem = smem_row<T, 0, 0, 0, 1, 8, 8>;
@@ -180,12 +194,12 @@ __device__ __forceinline__ void linear_kernel(void const *input_ptr,
       // because we will write output_smem later, but it may be still used in
       // some warp which are still write to gmem.
       if (NUM_ITERS_N > 1) {
-        __syncthreads();
+        wg_sync<WORKER_NUM_THREADS>(5);
       }
       // Initialize output_smem: if residual is provided, preload it; otherwise
       // zero
 #pragma unroll
-      for (int i = threadIdx.x; i < BATCH_SIZE * OUTPUT_ATOM_SIZE / CHUNK_SIZE;
+      for (int i = tid; i < BATCH_SIZE * OUTPUT_ATOM_SIZE / CHUNK_SIZE;
            i += NUM_THREADS) {
         int row = i / (OUTPUT_ATOM_SIZE / CHUNK_SIZE);
         int dst_col = (i % (OUTPUT_ATOM_SIZE / CHUNK_SIZE)) << log2_CHUNK_SIZE;
@@ -210,14 +224,13 @@ __device__ __forceinline__ void linear_kernel(void const *input_ptr,
       // Warm up weight and input tiles for the first ADJUSTED_PIPE_MAX - 1
       // tile.
 #pragma unroll
-      for (int istage = 0; istage < ADJUSTED_PIPE_MAX - 1; ++istage) {
+        for (int istage = 0; istage < ADJUSTED_PIPE_MAX - 1; ++istage) {
         // we don't need module for ADJUSTED_PIPE_MAX here, because we just load
         // ADJUSTED_PIPE_MAX - 1 pipe.
         int src_stage_offset = istage << log2_TILE_SIZE;
 
 #pragma unroll
         for (int chunk = 0; chunk < NUM_CHUNKS_A / NUM_THREADS; chunk++) {
-          int tid = threadIdx.x;
           int threadCol = (tid & (CHUNKS_PER_ROW_A - 1)) << log2_CHUNK_SIZE;
           int threadRow = tid >> log2_CHUNKS_PER_ROW_A;
           constexpr int ROWS_PER_ITERATION = NUM_THREADS / CHUNKS_PER_ROW_A;
@@ -234,7 +247,6 @@ __device__ __forceinline__ void linear_kernel(void const *input_ptr,
         }
 #pragma unroll
         for (int chunk = 0; chunk < NUM_CHUNKS_B / NUM_THREADS; chunk++) {
-          int tid = threadIdx.x;
           int threadRow = (tid & (CHUNKS_PER_COL_B - 1)) << log2_CHUNK_SIZE;
           int threadCol = tid >> log2_CHUNKS_PER_COL_B;
           constexpr int COLS_PER_ITERATION = NUM_THREADS / CHUNKS_PER_COL_B;
@@ -258,7 +270,7 @@ __device__ __forceinline__ void linear_kernel(void const *input_ptr,
       uint32_t a_frag[PIPE_INSIDE_TILE][4], b_frag[PIPE_INSIDE_TILE][4];
       // wait for first warm up pipeline cp.async finished
       cp_async_wait<ADJUSTED_PIPE_MAX - 2>();
-      __syncthreads();
+      wg_sync<WORKER_NUM_THREADS>(5);
 
       int warmup_m_col =
           (warp_row << (4 + log2_NUM_ITERS_K)) + ((lane_idx >> 4) << 3);
@@ -297,7 +309,6 @@ __device__ __forceinline__ void linear_kernel(void const *input_ptr,
               for (int chunk = 0; chunk < NUM_CHUNKS_A / NUM_THREADS; chunk++) {
                 // we don't need to hoist the threadCol and threadRow,,
                 // accorrding to experiment, the nvcc could hoist these const.
-                int tid = threadIdx.x;
                 int threadCol = (tid & (CHUNKS_PER_ROW_A - 1))
                                 << log2_CHUNK_SIZE;
                 int threadRow = tid >> log2_CHUNKS_PER_ROW_A;
@@ -316,7 +327,6 @@ __device__ __forceinline__ void linear_kernel(void const *input_ptr,
               }
 #pragma unroll
               for (int chunk = 0; chunk < NUM_CHUNKS_B / NUM_THREADS; chunk++) {
-                int tid = threadIdx.x;
                 int threadRow = (tid & (CHUNKS_PER_COL_B - 1))
                                 << log2_CHUNK_SIZE;
                 int threadCol = tid >> log2_CHUNKS_PER_COL_B;
@@ -346,7 +356,7 @@ __device__ __forceinline__ void linear_kernel(void const *input_ptr,
             } else {
               cp_async_wait<0>();
             }
-            __syncthreads();
+            wg_sync<WORKER_NUM_THREADS>(5);
 
             // TODO(Wenqin): The comment out code below here is what we could
             // do for just use ADD for input and weight shared memory pointer.
@@ -402,12 +412,12 @@ __device__ __forceinline__ void linear_kernel(void const *input_ptr,
               bfloat16(s_frag[(i << 1) | 0x1]);
         }
       }
-      __syncthreads();
+      wg_sync<WORKER_NUM_THREADS>(5);
 
       // Final writeback: store accumulated output (residual already included if
       // any)
 #pragma unroll
-      for (int i = threadIdx.x; i < NUM_CHUNKS_OUTPUT; i += NUM_THREADS) {
+      for (int i = tid; i < NUM_CHUNKS_OUTPUT; i += NUM_THREADS) {
         int row = i / CHUNKS_PER_ROW_C;
         int src_col = (i % CHUNKS_PER_ROW_C) << log2_CHUNK_SIZE;
         int dst_col = src_col + (nn << log2_OUTPUT_ATOM_SIZE);

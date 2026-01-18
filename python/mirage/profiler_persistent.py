@@ -50,6 +50,8 @@ event_name_list = {
     201: "TASK_SCHD_EVENTS",
     202: "TASK_GET_EVENT",
     203: "TASK_GET_NEXT_TASK",
+    204: "TASK_WORKER_ENTRY",
+    205: "TASK_WORKER_EXIT",
     230: "TASK_SM100_TASK_BEGIN",
     251: "TASK_SPLITK_LINEAR_SM100",
     252: "TASK_LINEAR_WITH_RESIDUAL_SM100",
@@ -117,7 +119,7 @@ def export_to_perfetto_trace(
             tag, num_blocks, num_groups
         )
 
-        event = event_name_list[event_idx] + f"_{event_no}"
+        event = event_name_list.get(event_idx, f"EVENT_{event_idx}") + f"_{event_no}"
         tid = tid_map[(block_idx, group_idx)]
 
         if (block_idx, group_idx, event_idx) in track_map:

@@ -9,6 +9,8 @@ import os, json
 DEFAULT_SAVE_DIR = os.path.join("outputs", "qwen3")
 MAX_SAVE_TOKENS = 100
 
+os.environ["HF_HUB_OFFLINE"] = "1"
+
 # print limitation
 # torch.set_printoptions(threshold=2000)
 
@@ -47,7 +49,7 @@ def max_factor_leq_n(m: int, n: int) -> int:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--use-mirage", action="store_true", help="Use Mirage kernels")
-    parser.add_argument("--max-num-batched-tokens", default=8, type=int, help="Max number of tokens in a batch")
+    parser.add_argument("--max-num-batched-tokens", default=16, type=int, help="Max number of tokens in a batch")
     parser.add_argument("--max-num-batched-requests", default=1, type=int, help="Max number of requests in a batch")
     parser.add_argument("--page-size", default=4096, type=int, help="Page size")
     parser.add_argument("--max-num-pages", default=16, type=int, help="Max num pages")
@@ -84,13 +86,13 @@ if __name__ == "__main__":
 
     parser.add_argument("--model-path", type=str, default=None, help="Path to a local model (necessary for multi-GPU demo)")
     parser.add_argument(
-        "--model", type=str, default='Qwen/Qwen3-8B', help="Model path on hugging face"
+        "--model", type=str, default='Qwen/Qwen3-0.6B', help="Model path on hugging face"
     )
     parser.add_argument(
         "--no-use-cutlass-kernel",
         action="store_false",
         dest="use_cutlass_kernel",
-        default=True,
+        default=False,
         help="Not use the cutlass version kernel.",
     )
     parser.add_argument("--ignore-eos", action="store_true", help="Ignore eos token during generation")

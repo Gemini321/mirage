@@ -28,9 +28,9 @@ __device__ __forceinline__ void silu_mul_task_impl(void const *input_ptr,
   T const *__restrict__ d_mul = static_cast<T const *>(input_ptr) + OUTPUT_SIZE;
   T *__restrict__ d_output = static_cast<T *>(output_ptr);
 
+  int const tid = worker_thread_id();
 #pragma unroll
-  for (int i = threadIdx.x; i < num_active_tokens * OUTPUT_SIZE;
-       i += blockDim.x) {
+  for (int i = tid; i < num_active_tokens * OUTPUT_SIZE; i += NUM_THREADS) {
     int batch_idx = i / OUTPUT_SIZE;
     int offset = i % OUTPUT_SIZE;
     float input_val = float(d_input[batch_idx * I_STRIDE + offset]);

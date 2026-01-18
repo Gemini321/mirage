@@ -60,8 +60,8 @@ __device__ __forceinline__ void
   constexpr size_t KV_CHUNK_SIZE = 64;
   float const sm_scale = (1.f / sqrt((float)HEAD_DIM));
 
-  int warp_idx = warp_id();
-  int idx_in_warp = threadIdx.x % 32;
+  int warp_idx = worker_warp_id();
+  int idx_in_warp = worker_thread_id() % 32;
 
   size_t total_seq_len = seq_len + EXTEND_NUM;
 
@@ -135,31 +135,41 @@ __device__ __forceinline__ void
 
   constexpr size_t TOTAL_SHARED_MEM_SIZE =
       K_NORM_SUM_OFFSET + NUM_WARPS * sizeof(float);
+  constexpr size_t SMEM_PER_GROUP =
+      ((TOTAL_SHARED_MEM_SIZE + 127) / 128) * 128;
+  char *smem_g =
+      smem + static_cast<size_t>(worker_group_id()) * SMEM_PER_GROUP;
 
   constexpr size_t SHARED_OUTPUT_OFFSET = 128;
   constexpr size_t ZERO_BUFFER_OFFSET = 0;
 
   // copy input
-  T *shared_q = (T *)(smem + SHARED_Q_OFFSET); // 1792 bytes (4 * 6 * 128 * 2B)
+  T *shared_q =
+      (T *)(smem_g + SHARED_Q_OFFSET); // 1792 bytes (4 * 6 * 128 * 2B)
   // copy weight
-  T *shared_k = (T *)(smem + SHARED_K_OFFSET); // 16384 bytes (64 * 128 * 2B)
+  T *shared_k =
+      (T *)(smem_g + SHARED_K_OFFSET); // 16384 bytes (64 * 128 * 2B)
   T *shared_k_buffer =
-      (T *)(smem + SHARED_K_BUFFER_OFFSET); // 16384 bytes (64 * 128 * 2B)
+      (T *)(smem_g + SHARED_K_BUFFER_OFFSET); // 16384 bytes (64 * 128 * 2B)
 
-  T *shared_v = (T *)(smem + SHARED_V_OFFSET); // 16384 bytes (64 * 128 * 2B)
+  T *shared_v =
+      (T *)(smem_g + SHARED_V_OFFSET); // 16384 bytes (64 * 128 * 2B)
   T *shared_v_buffer =
-      (T *)(smem + SHARED_V_BUFFER_OFFSET); // 16384 bytes (64 * 128 * 2B)
+      (T *)(smem_g + SHARED_V_BUFFER_OFFSET); // 16384 bytes (64 * 128 * 2B)
   // intermidiate
-  T *shared_output = (T *)(smem + SHARED_OUTPUT_OFFSET); // reuse shared_q
-  T *zero_buf = (T *)(smem + ZERO_BUFFER_OFFSET);        // 16 bytes (8 * 2B)
+  T *shared_output =
+      (T *)(smem_g + SHARED_OUTPUT_OFFSET); // reuse shared_q
+  T *zero_buf = (T *)(smem_g + ZERO_BUFFER_OFFSET); // 16 bytes (8 * 2B)
 
   // flashattn metadata
-  float *d_smem = (float *)(smem + D_OFFSET);     // 512 bytes (128 * 4B)
-  float *max_smem = (float *)(smem + MAX_OFFSET); // 512 bytes (128 * 4B)
-  float *o_smem = (float *)(smem + O_OFFSET);     // 16384 bytes (128 * 32 * 4B)
+  float *d_smem = (float *)(smem_g + D_OFFSET);     // 512 bytes (128 * 4B)
+  float *max_smem = (float *)(smem_g + MAX_OFFSET); // 512 bytes (128 * 4B)
+  float *o_smem = (float *)(smem_g + O_OFFSET);     // 16384 bytes (128 * 32 * 4B)
 
-  float *qnorm_sum = (float *)(smem + Q_NORM_SUM_OFFSET); // 16 bytes (4 * 4B)
-  float *knorm_sum = (float *)(smem + K_NORM_SUM_OFFSET); // 16 bytes (4 * 4B)
+  float *qnorm_sum =
+      (float *)(smem_g + Q_NORM_SUM_OFFSET); // 16 bytes (4 * 4B)
+  float *knorm_sum =
+      (float *)(smem_g + K_NORM_SUM_OFFSET); // 16 bytes (4 * 4B)
   // define the swizzle mode
 
   // zero buffer
@@ -184,7 +194,7 @@ __device__ __forceinline__ void
 
 // load first Q, K, V
 #pragma unroll
-  for (int i = threadIdx.x; i < TOTAL_Q_VEC_NUM * (HEAD_DIM / 8);
+  for (int i = worker_thread_id(); i < TOTAL_Q_VEC_NUM * (HEAD_DIM / 8);
        i += NUM_THREADS) {
     // offset in shared memory
     int q_smem_row = i / 16;
@@ -197,7 +207,7 @@ __device__ __forceinline__ void
   }
 
 #pragma unroll
-  for (int i = threadIdx.x; i < (curr_iter_len * 16); i += NUM_THREADS) {
+  for (int i = worker_thread_id(); i < (curr_iter_len * 16); i += NUM_THREADS) {
     // offset
     int row = i / 16;
     int col = (i % 16) * 8;
@@ -213,7 +223,7 @@ __device__ __forceinline__ void
 
 // V data loading: extract V from each token's QKV data for new tokens
 #pragma unroll
-  for (int i = threadIdx.x; i < (curr_iter_len * 16); i += NUM_THREADS) {
+  for (int i = worker_thread_id(); i < (curr_iter_len * 16); i += NUM_THREADS) {
     // offset
     int row = i / 16;
     int col = (i % 16) * 8;
@@ -281,7 +291,7 @@ __device__ __forceinline__ void
     // async load next k, v
     if (kv_idx + 1 != num_iterations) {
 #pragma unroll
-      for (int i = threadIdx.x; i < (next_iter_len * 16); i += NUM_THREADS) {
+      for (int i = worker_thread_id(); i < (next_iter_len * 16); i += NUM_THREADS) {
         // offset
         int row = i / 16;
         int col = (i % 16) * 8;
@@ -295,7 +305,7 @@ __device__ __forceinline__ void
         }
       }
 #pragma unroll
-      for (int i = threadIdx.x; i < (next_iter_len * 16); i += NUM_THREADS) {
+      for (int i = worker_thread_id(); i < (next_iter_len * 16); i += NUM_THREADS) {
         // offset
         int row = i / 16;
         int col = (i % 16) * 8;
@@ -325,7 +335,7 @@ __device__ __forceinline__ void
       v_cache_smem.set_ptr(shared_v);
       v_cache_smem_buffer.set_ptr(shared_v_buffer);
     }
-    __syncthreads();
+    wg_sync<WORKER_NUM_THREADS>(0);
 
     if (qk_norm) {
       // Q norm - only execute in the first chunk (kv_idx == 0) since all Q
@@ -383,7 +393,7 @@ __device__ __forceinline__ void
       }
     }
 
-    __syncthreads();
+    wg_sync<WORKER_NUM_THREADS>(0);
 
     // MMA
     float s_frag[NUM_Q_TOKEN_DIM_ITER][8];
@@ -422,7 +432,7 @@ __device__ __forceinline__ void
             s_frag[q_head_i], a_frag, b_frag, s_frag[q_head_i]);
       }
     }
-    __syncthreads();
+    wg_sync<WORKER_NUM_THREADS>(0);
 
 #pragma unroll
     for (int q_head_i = 0; q_head_i < NUM_Q_TOKEN_DIM_ITER; q_head_i++) {
@@ -531,7 +541,7 @@ __device__ __forceinline__ void
         mma_m16n16k16_bf16bf16bf32(
             o[q_head_i][n], o_frag, v_frag, o[q_head_i][n]);
       }
-      __syncthreads();
+      wg_sync<WORKER_NUM_THREADS>(0);
 
     } // q_head_i
 
@@ -542,7 +552,7 @@ __device__ __forceinline__ void
            kv_cache_row < cur_chunk_new_kv_end;
            kv_cache_row++) {
 #pragma unroll
-        for (int i = threadIdx.x; i < 128; i += NUM_THREADS) {
+        for (int i = worker_thread_id(); i < 128; i += NUM_THREADS) {
           int col = i;
           int smem_row =
               kv_cache_row -
@@ -571,7 +581,7 @@ __device__ __forceinline__ void
         for (int i = 0; i < 2; i++) {  // (0 1) or (4 5)
           int reg_idx = l * 2 + i * 4; // 0, 1, 4, 5 / 2, 3, 6, 7
           int osmem_offset = q_head_i * 2 * NUM_THREADS * 32 +
-                             l * NUM_THREADS * 32 + threadIdx.x * 32 + n * 4 +
+                             l * NUM_THREADS * 32 + worker_thread_id() * 32 + n * 4 +
                              i * 2;
           // 0&1 / 4&5 / 2&3 / 6&7
           o_smem[osmem_offset] = o[q_head_i][n][reg_idx];
@@ -581,9 +591,9 @@ __device__ __forceinline__ void
       if (m[q_head_i * 2 + l] != -inf) {
         m[q_head_i * 2 + l] *= sm_scale;
       }
-      d_smem[threadIdx.x] = d_sum[q_head_i * 2 + l];
-      max_smem[threadIdx.x] = m[q_head_i * 2 + l];
-      __syncthreads();
+      d_smem[worker_thread_id()] = d_sum[q_head_i * 2 + l];
+      max_smem[worker_thread_id()] = m[q_head_i * 2 + l];
+      wg_sync<WORKER_NUM_THREADS>(0);
       m[q_head_i * 2 + l] = -inf;
       d_sum[q_head_i * 2 + l] = 1.f;
 
@@ -627,7 +637,7 @@ __device__ __forceinline__ void
           }   // n
         }     // warp_id
       }       // only warp_idx == 0
-      __syncthreads();
+      wg_sync<WORKER_NUM_THREADS>(0);
 
     } // l
 
@@ -658,12 +668,12 @@ __device__ __forceinline__ void
         }
       }
     }
-    __syncthreads();
+    wg_sync<WORKER_NUM_THREADS>(0);
   } // q_head_i
 
 // write output to device memory
 #pragma unroll
-  for (int i = threadIdx.x; i < (TOTAL_Q_VEC_NUM * HEAD_DIM);
+  for (int i = worker_thread_id(); i < (TOTAL_Q_VEC_NUM * HEAD_DIM);
        i += NUM_THREADS) {
     // offset
     int smem_row = i / HEAD_DIM;

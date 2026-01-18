@@ -182,10 +182,12 @@ void register_mugraph(
   kn::KNCustomizedOp const *pre_op = nullptr;
   std::map<dim3, TaskId, Dim3Comparator> pre_task_map;
   std::unordered_set<size_t> nvshmem_events_idx;
+  int kernel_id = 0;
   for (auto const &op : graph.operators) {
     if (op->op_type == type::KNOperatorType::KN_INPUT_OP) {
       continue;
     }
+    size_t kernel_begin_task_id = all_tasks.size();
     std::tuple<int, int, TaskType, int> task_config =
         task_configs.find(op)->second;
     std::map<dim3, TaskId, Dim3Comparator> cur_task_map;
@@ -303,6 +305,9 @@ void register_mugraph(
       for (bid.x = 0; bid.x < bgraph.grid_dim.x; bid.x++) {
         for (bid.y = 0; bid.y < bgraph.grid_dim.y; bid.y++) {
           for (bid.z = 0; bid.z < bgraph.grid_dim.z; bid.z++) {
+      // for (bid.z = 0; bid.z < bgraph.grid_dim.z; bid.z++) {
+      //   for (bid.y = 0; bid.y < bgraph.grid_dim.y; bid.y++) {
+      //     for (bid.x = 0; bid.x < bgraph.grid_dim.x; bid.x++) {
             // event_desc_1 is the trigger_event of allgather
             EventDesc event_desc_1;
             event_desc_1.event_type = EVENT_LAUNCH_TASKS;
@@ -509,6 +514,13 @@ void register_mugraph(
                                   pre_task_map, /*pre_task_map*/
                                   cur_task_map /*cur_task_map)*/);
     }
+    size_t kernel_end_task_id = all_tasks.size();
+    for (size_t tid = kernel_begin_task_id; tid < kernel_end_task_id; ++tid) {
+      all_tasks[tid].kernel_id = kernel_id;
+      all_tasks[tid].kernel_begin_task_id = kernel_begin_task_id;
+      all_tasks[tid].kernel_end_task_id = kernel_end_task_id;
+    }
+    kernel_id += 1;
     pre_output_ops = output_ops;
     pre_op = cur_op;
     pre_task_map = cur_task_map;
@@ -624,6 +636,7 @@ TaskGraphResult print_task_graph(
   mirage::transpiler::CodeKeeper tgbody;
   tgbody.inc_indent();
   code.e("#include \"persistent_kernel.cuh\"");
+  code.e("#include <cutlass/arch/reg_reconfig.h>");
   if (use_json_format) {
     code.e("#include <nlohmann/json.hpp>");
     code.e("#include <fstream>");
@@ -661,6 +674,17 @@ TaskGraphResult print_task_graph(
     code.e("FullTaskDesc "
            "task_desc(static_cast<TaskType>(task.at(\"task_type\")),");
     code.e("            task.at(\"variant_id\"));");
+    code.e("if (task.contains(\"kernel_id\")) {");
+    code.e("  task_desc.kernel_id = task.at(\"kernel_id\").get<int>();");
+    code.e("}");
+    code.e("if (task.contains(\"kernel_begin_task_id\")) {");
+    code.e("  task_desc.kernel_begin_task_id = "
+           "task.at(\"kernel_begin_task_id\").get<unsigned long long int>();");
+    code.e("}");
+    code.e("if (task.contains(\"kernel_end_task_id\")) {");
+    code.e("  task_desc.kernel_end_task_id = "
+           "task.at(\"kernel_end_task_id\").get<unsigned long long int>();");
+    code.e("}");
     code.e("task_desc.task_metadata.request_id = "
            "task.at(\"request_id\").get<int>();");
     code.e("task_desc.task_metadata.expert_offset = "
@@ -865,6 +889,9 @@ TaskGraphResult print_task_graph(
     json_task_graph["all_tasks"].push_back(
         json{{"task_type", TASK_TERMINATE},
              {"variant_id", 0},
+             {"kernel_id", -1},
+             {"kernel_begin_task_id", TASK_INVALID_ID},
+             {"kernel_end_task_id", TASK_INVALID_ID},
              {"inputs", {}},
              {"outputs", {}},
              {"trigger_event", EVENT_INVALID_ID},
@@ -880,6 +907,9 @@ TaskGraphResult print_task_graph(
     json_task_graph["all_tasks"].push_back(
         json{{"task_type", TASK_BEGIN_TASK_GRAPH},
              {"variant_id", 0},
+             {"kernel_id", -1},
+             {"kernel_begin_task_id", TASK_INVALID_ID},
+             {"kernel_end_task_id", TASK_INVALID_ID},
              {"inputs", {}},
              {"outputs", {}},
              {"trigger_event",
@@ -946,6 +976,9 @@ TaskGraphResult print_task_graph(
               json json_task = {
                   {"task_type", task_desc.task_type},
                   {"variant_id", task_desc.variant_id},
+                  {"kernel_id", task_desc.kernel_id},
+                  {"kernel_begin_task_id", task_desc.kernel_begin_task_id},
+                  {"kernel_end_task_id", task_desc.kernel_end_task_id},
                   {"inputs", {}},
                   {"outputs", {}},
                   {"trigger_event", task_desc.trigger_event},
@@ -1107,6 +1140,9 @@ TaskGraphResult print_task_graph(
       json_task = {
           {"task_type", task_desc.task_type},
           {"variant_id", task_desc.variant_id},
+          {"kernel_id", task_desc.kernel_id},
+          {"kernel_begin_task_id", task_desc.kernel_begin_task_id},
+          {"kernel_end_task_id", task_desc.kernel_end_task_id},
           {"inputs", {}},
           {"outputs", {}},
           {"trigger_event", task_desc.trigger_event},
@@ -1415,22 +1451,103 @@ TaskGraphResult print_task_graph(
 
   code.e("__device__ __forceinline__");
   code.e("void _execute_task(TaskDesc const* task_desc,");
-  code.e("                   RuntimeConfig const &runtime_config) {");
+  code.e("                   RuntimeConfig const &runtime_config,");
+  code.e("                   void* exec_ctx,");
+  code.e("                   int group_id,");
+  code.e("                   char* smem_base,");
+  code.e("                   uint32_t smem_capacity) {");
   TaskRegister *task_register = TaskRegister::get_instance();
-  bool first_task = true;
+  bool emitted_any_branch = false;
   for (auto const &task : task_register->all_task_variants) {
     for (size_t variant_id = 0; variant_id < task.second.size(); variant_id++) {
-      std::string cond = first_task ? "if" : "else if";
       assert(task_type_to_name.find(task.first) != task_type_to_name.end());
-      code.e("$ (task_desc->task_type == $ && task_desc->variant_id == $) {",
-             cond,
-             task_type_to_name[task.first],
-             variant_id);
+      if (!emitted_any_branch) {
+        code.e("if (task_desc->task_type == $ && task_desc->variant_id == $) {",
+               task_type_to_name[task.first],
+               variant_id);
+        emitted_any_branch = true;
+      } else {
+        code.e(
+            "else if (task_desc->task_type == $ && task_desc->variant_id == $) {",
+            task_type_to_name[task.first],
+            variant_id);
+      }
+      code.e("#if defined(MIRAGE_GRACE_HOPPER)");
+      // Hardcode per-task/variant resource usage (regs + dynamic smem) so ptxas
+      // sees a predictable target at each branch and the runtime can drive
+      // setmaxnreg deterministically without relying on a shared switch.
+      //
+      // NOTE: These numbers are derived from entry regprobe reports and use
+      // conservative rounding (regs -> next multiple of 8).
+      int reg_target = 224;
+      int smem_dynamic = 0;
+      bool smem_dynamic_is_capacity = true;
+      if (task.first == TASK_PAGED_ATTENTION_HOPPER && variant_id == 0) {
+        reg_target = 192;        // regs=188 -> ceil8
+        smem_dynamic = 120000;   // smem_dynamic_used
+        smem_dynamic_is_capacity = false;
+      } else if (task.first == TASK_ARGMAX_PARTIAL_SM100 && variant_id == 0) {
+        reg_target = 96;         // regs=32
+        smem_dynamic = 10000;
+        smem_dynamic_is_capacity = false;
+      } else if (task.first == TASK_ARGMAX_REDUCE && variant_id == 0) {
+        reg_target = 96;         // regs=32
+        smem_dynamic = 10000;
+        smem_dynamic_is_capacity = false;
+      } else if (task.first == TASK_LINEAR_SWAPAB_WITH_RESIDUAL_HOPPER &&
+                 (variant_id == 0 || variant_id == 1)) {
+        reg_target = 96;         // regs=32
+        smem_dynamic = 60000;
+        smem_dynamic_is_capacity = false;
+      } else if (task.first == TASK_LINEAR_SWAPAB_HOPPER &&
+                 (variant_id == 0 || variant_id == 1 || variant_id == 2)) {
+        reg_target = 128;         // regs=30/31 -> ceil8
+        smem_dynamic = 60000;
+        smem_dynamic_is_capacity = false;
+      } else if (task.first == TASK_RMS_NORM_HOPPER && variant_id == 0) {
+        reg_target = 96;         // regs=30 -> ceil8
+        smem_dynamic = 30000;
+        smem_dynamic_is_capacity = false;
+      } else if (task.first == TASK_EMBEDDING && variant_id == 0) {
+        reg_target = 96;         // regs=20 -> ceil8
+        smem_dynamic = 10000;
+        smem_dynamic_is_capacity = false;
+      } else if (task.first == TASK_SILU_MUL && variant_id == 0) {
+        reg_target = 96;         // regs=19 -> ceil8
+        smem_dynamic = 10000;
+        smem_dynamic_is_capacity = false;
+      }
+      code.e("uint32_t __mirage_reg_target = $;", reg_target);
+      if (smem_dynamic_is_capacity) {
+        code.e("uint32_t __mirage_smem_dynamic = smem_capacity;");
+      } else {
+        code.e("uint32_t __mirage_smem_dynamic = $;", smem_dynamic);
+      }
+      // code.e("char* task_smem_ptr = __mirage_task_enter(reinterpret_cast<__mirage_exec_ctx*>(exec_ctx),");
+      // code.e("                                  group_id,");
+      // code.e("                                  __mirage_reg_target,");
+      // code.e("                                  __mirage_smem_dynamic,");
+      // code.e("                                  smem_base,");
+      // code.e("                                  smem_capacity);");
+      code.e("char* task_smem_ptr = __mirage_task_enter_smem_only(reinterpret_cast<__mirage_exec_ctx*>(exec_ctx),");
+      code.e("                                  group_id,");
+      code.e("                                  __mirage_smem_dynamic,");
+      code.e("                                  smem_base,");
+      code.e("                                  smem_capacity);");
+      code.e("#else");
+      code.e("char* task_smem_ptr = smem_base;");
+      code.e("#endif");
+      code.e("// MIRAGE_TASK_BODY_BEGIN");
       code.e("$", task.second[variant_id]);
+      code.e("// MIRAGE_TASK_BODY_END");
+      code.e("#if defined(MIRAGE_GRACE_HOPPER)");
+      // code.e("__mirage_task_exit(reinterpret_cast<__mirage_exec_ctx*>(exec_ctx), group_id, __mirage_reg_target);");
+      code.e("__mirage_task_exit_smem_only(reinterpret_cast<__mirage_exec_ctx*>(exec_ctx), group_id);");
+      code.e("#endif");
+      code.e("return;");
       code.e("}");
-      first_task = false;
-    }
-  }
+	    }
+	  }
   code.e("}");
 
   // Write json to output file

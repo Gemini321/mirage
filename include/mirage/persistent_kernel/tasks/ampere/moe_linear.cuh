@@ -236,9 +236,13 @@ __device__ __forceinline__ void
   constexpr int kStage = Config::kStage; // 8
 
   extern __shared__ char smem[];
+  constexpr size_t SMEM_PER_GROUP =
+      ((Config::kShmSize + 127) / 128) * 128;
+  char *smem_g =
+      smem + static_cast<size_t>(worker_group_id()) * SMEM_PER_GROUP;
 
   // To make the start of shared memory aligned.
-  T *shm_data = (T *)((reinterpret_cast<uintptr_t>(smem) + 127) / 128 * 128);
+  T *shm_data = (T *)((reinterpret_cast<uintptr_t>(smem_g) + 127) / 128 * 128);
 
   T *Ashm = shm_data;
   T *Bshm = shm_data + cute::cosize(SmemLayoutA{});
@@ -395,7 +399,7 @@ __device__ __forceinline__ void
           PRINT(cta_cC);
         }
 #endif
-        const int idx = threadIdx.x;
+        const int idx = worker_thread_id();
 
         TiledMMA tiled_mma;
         auto thr_mma = tiled_mma.get_slice(idx);
@@ -477,14 +481,14 @@ __device__ __forceinline__ void
           // TODO(Wenqin): The variable named with "s2g", but what we actually
           // do here is "g2s", maybe we should rename it for reusing code.
           cute::copy_if(g2s_tiled_copy_r, tCpC, tCgR_s2g, tCsR_s2g);
-          __syncthreads();
+          wg_sync<WORKER_NUM_THREADS>(0);
           // load residual to accumulator registers
           // SMEM to register
           auto tCrD_r2s_view = r2s_thr_copy_c.retile_D(tCrD); // view of tCrD
           auto tCsR_r2s_view =
               r2s_thr_copy_c.partition_S(sR_init); // view of sR_init
           cute::copy(tCsR_r2s_view, tCrD_r2s_view);
-          __syncthreads();
+          wg_sync<WORKER_NUM_THREADS>(0);
         } else {
           clear(tCrD);
         }
@@ -633,7 +637,7 @@ __device__ __forceinline__ void
         }
 
         cp_async_wait<kStage - 2>();
-        __syncthreads();
+        wg_sync<WORKER_NUM_THREADS>(0);
 
         int ik = 0;
         cute::copy(s2r_tiled_copy_a,
@@ -677,7 +681,7 @@ __device__ __forceinline__ void
               } else {
                 cp_async_wait<0>();
               }
-              __syncthreads();
+              wg_sync<WORKER_NUM_THREADS>(0);
 
               ismem_read_stage = (ismem_read_stage + 1) % kStage;
             }
@@ -749,7 +753,7 @@ __device__ __forceinline__ void
 
         cute::copy(r2s_tiled_copy_c, tC_tmp, tCsC_r2s(_, _, _, 0));
         // ((_2,_4),_1,_1) -> ((_2,(_2,_2)),_1,_1)
-        __syncthreads();
+        wg_sync<WORKER_NUM_THREADS>(0);
 
         // We couldn't use s2g_tiled_copy_c copy here, because its granularity
         // is too big for use to use the predicate, try to find a suitable way
@@ -757,7 +761,7 @@ __device__ __forceinline__ void
         // tCgC_s2g);
         constexpr int write_back_batch_size =
             kTileM < BATCH_SIZE ? kTileM : BATCH_SIZE;
-        for (int i = threadIdx.x; i < write_back_batch_size * OUTPUT_SIZE;
+        for (int i = worker_thread_id(); i < write_back_batch_size * OUTPUT_SIZE;
              i += MOE_NUM_THREADS) {
           int const t = i / OUTPUT_SIZE;
           int const o = i % OUTPUT_SIZE;
@@ -776,7 +780,7 @@ __device__ __forceinline__ void
         constexpr bool need_sync_after_writeback =
             (LoopN > 1 || LoopM > 1) && ((ntile + 1) % PIPE_MAX == 0);
         if (need_sync_after_writeback) {
-          __syncthreads();
+          wg_sync<WORKER_NUM_THREADS>(0);
         }
       } // n_iter
     } // m_iter

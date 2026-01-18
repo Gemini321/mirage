@@ -176,6 +176,8 @@ def get_compile_command(
     flags = flags + [f"-DMPK_MAX_SEQ_LENGTH={mpk.max_seq_length}"]
     # Use when debugging
     # flags = flags + [f"-DMPK_ENABLE_VERBOSE"]
+    # flags = flags + [f"-DMIRAGE_ADMISSION_DEBUG"]
+    # flags = flags + [f"-DMIRAGE_SCHED_LOG"]
 
     if use_nvshmem:
         nvshmem_cmd = [
@@ -921,6 +923,9 @@ class PersistentKernel:
         assert weight.num_dims == 2  # (hidden_size, hidden_size / world_size)
         assert output.num_dims == 2  # (batch_size, hidden_size)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # tb_graph.new_input(input, (-1, -1, -1), 1, True)
+        # tb_graph.new_input(weight, (0, -1, -1), 1, True)
+        # tb_graph.new_input(output, (1, -1, -1), -1, True)
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
         tb_graph.new_input(weight, (0, -1, -1), 1, True)
         tb_graph.new_input(output, (1, -1, -1), -1, True)

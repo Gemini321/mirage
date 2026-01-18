@@ -35,6 +35,16 @@ __device__ __forceinline__ unsigned long long int
 }
 
 __device__ __forceinline__ unsigned long long int
+    atom_add_relaxed_gpu_u64(unsigned long long int *addr,
+                             unsigned long long int val) {
+  unsigned long long int old_val;
+  asm volatile("atom.add.relaxed.gpu.u64 %0,[%1],%2;"
+               : "=l"(old_val)
+               : "l"(addr), "l"(val));
+  return old_val;
+}
+
+__device__ __forceinline__ unsigned long long int
     atom_cas_release_gpu_u64(unsigned long long int *addr,
                              unsigned long long int cmp,
                              unsigned long long int val) {

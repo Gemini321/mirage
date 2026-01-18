@@ -34,15 +34,12 @@ __device__ __forceinline__ void rms_norm(InputSmem smem_input,
   }
   constexpr int ROTARY_PARTICIPATING_THREADS =
       (NUM_THREADS < HEAD_DIM ? NUM_THREADS : HEAD_DIM);
-  // Ampere doesn't support cutlass barrier, use cooperative groups.
-  auto block_group = cooperative_groups::this_thread_block();
-  auto participating_group =
-      cooperative_groups::tiled_partition<ROTARY_PARTICIPATING_THREADS>(
-          block_group);
+  // Use group-local barriers to keep 2-group execution safe.
 
   // smem_input: NUM_HEADS * (WINDOW_SIZE or CHUNK_SIZE), HEAD_DIM
   // TODO(Wenqin): handle if speculative window of k span two chunks.
-  int warp_idx = warp_id();
+  int const tid = worker_thread_id();
+  int const warp_idx = tid >> 5;
 #pragma unroll
   for (int win_idx = 0; win_idx < window_size; ++win_idx) {
     // token_offset is the offset for first token in input SMEM (auto-agressive
@@ -54,7 +51,7 @@ __device__ __forceinline__ void rms_norm(InputSmem smem_input,
     for (int head_idx = 0; head_idx < NUM_HEAD; ++head_idx) {
       float sum = 0.0f;
 #pragma unroll
-      for (uint32_t i = threadIdx.x; i < HEAD_DIM; i += NUM_THREADS) {
+      for (uint32_t i = tid; i < HEAD_DIM; i += NUM_THREADS) {
         int row = smem_seq_idx * NUM_HEAD + head_idx;
         int col = i;
         float val = (float)smem_input.at(row, col);
@@ -67,11 +64,11 @@ __device__ __forceinline__ void rms_norm(InputSmem smem_input,
         sum += shfl_xor_sync(sum, offset);
       }
 
-      if (threadIdx.x % 32 == 0) {
+      if ((tid & 31) == 0) {
         reduce_smem[warp_idx] = sum;
       }
-      __syncthreads();
-      sum = threadIdx.x < NUM_WARPS ? reduce_smem[threadIdx.x] : 0.0f;
+      wg_sync<WORKER_NUM_THREADS>(0);
+      sum = tid < NUM_WARPS ? reduce_smem[tid] : 0.0f;
 
 #pragma unroll
       for (uint32_t offset = NUM_THREADS_PER_WARP / 2; offset > 0;
@@ -79,17 +76,17 @@ __device__ __forceinline__ void rms_norm(InputSmem smem_input,
         sum += shfl_xor_sync(sum, offset);
       }
 
-      if (threadIdx.x == 0) {
+      if (tid == 0) {
         reduce_smem[0] = sum;
       }
 
-      __syncthreads();
+      wg_sync<WORKER_NUM_THREADS>(0);
 
       float rms_rcp = rsqrt(reduce_smem[0] / float(HEAD_DIM) + eps);
 
       // multiply with weight
 #pragma unroll
-      for (uint32_t i = threadIdx.x; i < HEAD_DIM; i += NUM_THREADS) {
+      for (uint32_t i = tid; i < HEAD_DIM; i += NUM_THREADS) {
         int row = smem_seq_idx * NUM_HEAD + head_idx;
         int col = i;
         float val = (float)smem_input.at(row, col);
@@ -100,7 +97,7 @@ __device__ __forceinline__ void rms_norm(InputSmem smem_input,
         if (rotary_emd) {
           // we should do rope for all the window size q and k, because they
           // came from hidden states, we didn't apply rope yet.
-          participating_group.sync();
+          wg_sync<WORKER_NUM_THREADS>(0);
           T const *cur_cos_ptr = cos_ptr + win_idx * HEAD_DIM;
           T const *cur_sin_ptr = sin_ptr + win_idx * HEAD_DIM;
           float cos = (float)cur_cos_ptr[i];
@@ -116,7 +113,7 @@ __device__ __forceinline__ void rms_norm(InputSmem smem_input,
             float v2 = (float)smem_input.at(row, col - HEAD_DIM / 2);
             v_rot = v1 * cos + v2 * sin;
           }
-          participating_group.sync();
+          wg_sync<WORKER_NUM_THREADS>(0);
           // output shape (window_size, head_num, head_dim)
           smem_input.at(row, col) = (T)v_rot;
         }

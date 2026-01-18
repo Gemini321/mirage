@@ -32,11 +32,7 @@ __device__ __forceinline__ void rotary_embedding(InputSmem smem_input,
   static_assert(HEAD_DIM < NUM_THREADS || HEAD_DIM % NUM_THREADS == 0);
   constexpr int ROTARY_PARTICIPATING_THREADS =
       (NUM_THREADS < HEAD_DIM ? NUM_THREADS : HEAD_DIM);
-  // Ampere doesn't support cutlass barrier, use cooperative groups.
-  auto block_group = cooperative_groups::this_thread_block();
-  auto participating_group =
-      cooperative_groups::tiled_partition<ROTARY_PARTICIPATING_THREADS>(
-          block_group);
+  int const tid = worker_thread_id();
 #pragma unroll
   for (int win_idx = 0; win_idx < WINDOW_SIZE; ++win_idx) {
 
@@ -49,7 +45,7 @@ __device__ __forceinline__ void rotary_embedding(InputSmem smem_input,
       T const *cur_sin_ptr = sin_ptr + win_idx * HEAD_DIM;
 
 #pragma unroll
-      for (uint32_t i = threadIdx.x; i < HEAD_DIM; i += NUM_THREADS) {
+      for (uint32_t i = tid; i < HEAD_DIM; i += NUM_THREADS) {
         int offset = (i / HEAD_DIM) * HEAD_DIM + i;
 
         int row = smem_seq_idx * NUM_HEAD + head_idx;
@@ -60,7 +56,7 @@ __device__ __forceinline__ void rotary_embedding(InputSmem smem_input,
 
         float v_rot;
 
-        participating_group.sync();
+        wg_sync<WORKER_NUM_THREADS>(0);
 
         if (i < HEAD_DIM / 2) {
           float v1 = static_cast<float>(smem_input.at(row, col));
@@ -72,7 +68,7 @@ __device__ __forceinline__ void rotary_embedding(InputSmem smem_input,
           v_rot = v1 * cos + v2 * sin;
         }
 
-        participating_group.sync();
+        wg_sync<WORKER_NUM_THREADS>(0);
         smem_input.at(row, col) = static_cast<T>(v_rot);
       }
     }

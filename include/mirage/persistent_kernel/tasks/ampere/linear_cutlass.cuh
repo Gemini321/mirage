@@ -48,7 +48,7 @@ __device__ __noinline__ void linear_kernel(void const *input_ptr,
   // gemm_multi_stage(void *Dptr, const void *Aptr, const void *Bptr, const void
   // *Rptr, int m, int n, int k) {
 #if 0
-  if (threadIdx.x == 0) {
+  if (worker_thread_id() == 0) {
     printf("Entering linear_kernel with BATCH_SIZE: %d, OUTPUT_SIZE: %d, REDUCTION_SIZE: %d, O_STRIDE: %d, PIPE_MAX: %d, residual: %d\n", BATCH_SIZE, OUTPUT_SIZE, REDUCTION_SIZE, O_STRIDE, PIPE_MAX, residual);
   }
 #endif
@@ -70,7 +70,7 @@ __device__ __noinline__ void linear_kernel(void const *input_ptr,
                                     kSmemLayoutCBatch,
                                     float>;
   using namespace cute;
-  // if (threadIdx.x == 0) {
+  // if (worker_thread_id() == 0) {
   //   printf("SmemLayoutAtom: \n"); print(typename Config::SmemLayoutAtom{});
   //   printf("\n"); printf("SmemLayoutA: \n"); print(typename
   //   Config::SmemLayoutA{}); printf("\n"); printf("SmemLayoutB: \n");
@@ -105,13 +105,17 @@ __device__ __noinline__ void linear_kernel(void const *input_ptr,
   // constexpr int k = Config::REDUCTION_SIZE;
 
   extern __shared__ char smem[];
+  constexpr size_t SMEM_PER_GROUP =
+      ((Config::kShmSize + 127) / 128) * 128;
+  char *smem_g =
+      smem + static_cast<size_t>(worker_group_id()) * SMEM_PER_GROUP;
   // Align the shared memory to 128 bytes
-  T *shm_data = (T *)((reinterpret_cast<uintptr_t>(smem) + 127) / 128 * 128);
+  T *shm_data = (T *)((reinterpret_cast<uintptr_t>(smem_g) + 127) / 128 * 128);
 
   T *Ashm = shm_data;
   T *Bshm = shm_data + cute::cosize(SmemLayoutA{});
 
-  int idx = threadIdx.x;
+  int idx = worker_thread_id();
 
 #if 0
   if (idx == 0) {
@@ -242,13 +246,13 @@ __device__ __noinline__ void linear_kernel(void const *input_ptr,
       if (residual) {
         // cute::copy(s2g_tiled_copy_c, tCgR_s2g, tCsR_s2g);
         cute::copy_if(s2g_tiled_copy_c, tCpC, tCgR_s2g, tCsR_s2g);
-        __syncthreads();
+        wg_sync<WORKER_NUM_THREADS>(0);
         // load residual to accumulator registers
         auto tCrD_r2s_view = r2s_thr_copy_c.retile_D(tCrD); // view of tCrD
         auto tCsR_r2s_view =
             r2s_thr_copy_c.partition_S(sR_init); // view of sR_init
         cute::copy(tCsR_r2s_view, tCrD_r2s_view);
-        __syncthreads();
+        wg_sync<WORKER_NUM_THREADS>(0);
       } else {
         clear(tCrD);
       }
@@ -353,7 +357,7 @@ __device__ __noinline__ void linear_kernel(void const *input_ptr,
 
       // TODO: cp_async_wait later?
       cp_async_wait<kStage - 2>();
-      __syncthreads();
+      wg_sync<WORKER_NUM_THREADS>(0);
 
       int ik = 0;
       cute::copy(s2r_tiled_copy_a,
@@ -374,7 +378,7 @@ __device__ __noinline__ void linear_kernel(void const *input_ptr,
 
           if (ik == nk - 1) {
             cp_async_wait<kStage - 2>();
-            __syncthreads();
+            wg_sync<WORKER_NUM_THREADS>(0);
 
             ismem_read_stage = (ismem_read_stage + 1) % kStage;
           }
@@ -460,7 +464,7 @@ __device__ __noinline__ void linear_kernel(void const *input_ptr,
 #endif
       cute::copy(r2s_tiled_copy_c, tC_tmp, tCsC_r2s(_, _, _, 0));
       // ((_2,_4),_1,_1) -> ((_2,(_2,_2)),_1,_1)
-      __syncthreads();
+      wg_sync<WORKER_NUM_THREADS>(0);
 
       // cute::copy(s2g_tiled_copy_c, tCsC_s2g(_, _, _, 0), tCgC_s2g);
       cute::copy_if(s2g_tiled_copy_c, tCpC_ep, tCsC_s2g(_, _, _, 0), tCgC_s2g);

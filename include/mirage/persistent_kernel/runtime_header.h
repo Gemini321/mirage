@@ -16,6 +16,7 @@
 #pragma once
 
 #include "mirage/config.h"
+#include <cstdint>
 #include <cuda_runtime.h>
 
 namespace mirage {
@@ -122,6 +123,10 @@ enum TaskType {
   TASK_SCHD_EVENTS = 201,
   TASK_GET_EVENT = 202,
   TASK_GET_NEXT_TASK = 203,
+  // Profiling-only: marks entry into the worker scheduling loop.
+  TASK_WORKER_ENTRY = 204,
+  // Profiling-only: marks the worker exit path just before returning.
+  TASK_WORKER_EXIT = 205,
 };
 
 enum EventType {
@@ -141,8 +146,8 @@ struct TensorDesc {
   void *tma_desc_ptrs[mirage::config::MAX_TMA_DESC_PER_TENSOR];
 #endif
   int data_type;
-  int dim[mirage::config::MAX_TENSOR_DIMS];
-  int stride[mirage::config::MAX_TENSOR_DIMS];
+  int64_t dim[mirage::config::MAX_TENSOR_DIMS];
+  int64_t stride[mirage::config::MAX_TENSOR_DIMS];
 };
 
 struct EventDesc {
@@ -161,15 +166,24 @@ struct FullTaskDesc {
       : task_type(t), variant_id(_variant_id), num_inputs(0), num_outputs(0),
         trigger_event(EVENT_INVALID_ID), dependent_event(EVENT_INVALID_ID) {
     task_metadata.raw_payload = ~0ull;
+    kernel_id = -1;
+    kernel_begin_task_id = TASK_INVALID_ID;
+    kernel_end_task_id = TASK_INVALID_ID;
   }
   FullTaskDesc() {
     task_metadata.raw_payload = ~0ull;
+    kernel_id = -1;
+    kernel_begin_task_id = TASK_INVALID_ID;
+    kernel_end_task_id = TASK_INVALID_ID;
   }
   TaskType task_type;
   unsigned variant_id;
   int num_inputs, num_outputs;
   EventId trigger_event;
   EventId dependent_event;
+  int kernel_id;
+  TaskId kernel_begin_task_id;
+  TaskId kernel_end_task_id;
   TensorDesc inputs[MAX_INPUTS_PER_TASK];
   TensorDesc outputs[MAX_OUTPUTS_PER_TASK];
   union TaskMetadata {
@@ -196,7 +210,8 @@ struct alignas(16) TaskDesc {
   TaskDesc(FullTaskDesc t)
       : task_type(t.task_type), variant_id(t.variant_id),
         trigger_event(t.trigger_event), dependent_event(t.dependent_event),
-        task_metadata(t.task_metadata) {
+        kernel_id(t.kernel_id), kernel_begin_task_id(t.kernel_begin_task_id),
+        kernel_end_task_id(t.kernel_end_task_id), task_metadata(t.task_metadata) {
     for (int i = 0; i < t.num_inputs; i++) {
       input_ptrs[i] = t.inputs[i].base_ptr;
     }
@@ -218,11 +233,17 @@ struct alignas(16) TaskDesc {
   }
   TaskDesc() {
     task_metadata.raw_payload = ~0ull;
+    kernel_id = -1;
+    kernel_begin_task_id = TASK_INVALID_ID;
+    kernel_end_task_id = TASK_INVALID_ID;
   }
   TaskType task_type;
   unsigned variant_id;
   EventId trigger_event;
   EventId dependent_event;
+  int kernel_id;
+  TaskId kernel_begin_task_id;
+  TaskId kernel_end_task_id;
   void *input_ptrs[MAX_INPUTS_PER_TASK];
   void *output_ptrs[MAX_OUTPUTS_PER_TASK];
 #ifdef MPK_ENABLE_TMA
@@ -239,6 +260,9 @@ struct RuntimeConfig {
   int num_gpus, my_gpu_id;
   int num_events;
   unsigned long long int per_worker_queue_len, per_sched_queue_len;
+  // Runtime-selected register targets (regs/thread) for control paths.
+  // Indices match `__mirage_reg_slot` when compiled for Hopper/Blackwell.
+  // uint32_t reg_targets[4];
   unsigned long long int *worker_queue_last_ready_task_id;
   unsigned long long int *sched_queue_last_ready_event_id;
   unsigned long long int *sched_queue_next_free_event_id;
@@ -272,6 +296,9 @@ struct RuntimeConfig {
   void *profiler_buffer;
   bool split_worker_scheduler;
   cudaStream_t worker_stream, scheduler_stream;
+  // Dynamic shared memory configured for split kernels (bytes).
+  int worker_dynamic_smem_bytes;
+  // int persistent_dynamic_smem_bytes;
 };
 
 } // namespace runtime

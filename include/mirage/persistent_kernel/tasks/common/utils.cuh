@@ -102,13 +102,16 @@ __device__ __forceinline__ void clear_smem_buffer(T *buffer) {
       num_128bit_writes * (16 / sizeof(T));
 
   // Clear the bulk of the buffer using 128-bit writes
-  for (int i = threadIdx.x; i < num_128bit_writes; i += NUM_THREADS) {
+  // Use group-local thread indexing so this works with 2-group (2*NUM_THREADS)
+  // launches, where each group operates on a disjoint SMEM region.
+  int const tid = threadIdx.x & (NUM_THREADS - 1);
+  for (int i = tid; i < num_128bit_writes; i += NUM_THREADS) {
     ((__uint128_t *)buffer)[i] = 0ul;
   }
 
   // Handle the tail if the total size is not a multiple of 16 bytes
   if constexpr ((total_bytes % 16) != 0) {
-    for (int i = remaining_elements_offset + threadIdx.x; i < NUM_ELEMENTS;
+    for (int i = remaining_elements_offset + tid; i < NUM_ELEMENTS;
          i += NUM_THREADS) {
       buffer[i] = T(0.0f);
     }
@@ -133,15 +136,48 @@ struct vec_zero_t {
     constexpr int num_chunks = total_bytes / sizeof(__uint128_t);
     __uint128_t *vec_ptr = reinterpret_cast<__uint128_t *>(ptr);
     constexpr int max_iters = (num_chunks + NUM_THREADS - 1) / NUM_THREADS;
+    int const tid = threadIdx.x & (NUM_THREADS - 1);
 
 #pragma unroll
     for (int i = 0; i < max_iters; ++i) {
-      int idx = i * blockDim.x + threadIdx.x;
+      int idx = i * NUM_THREADS + tid;
       if (idx < num_chunks) {
         vec_ptr[idx] = 0ul;
       }
     }
   }
 };
+
+#define WORKER_NUM_THREADS 128
+
+static __device__ __forceinline__ int worker_group_id() {
+  return threadIdx.x / WORKER_NUM_THREADS;
+}
+
+static __device__ __forceinline__ int worker_thread_id() {
+  return threadIdx.x % WORKER_NUM_THREADS;
+}
+
+static __device__ __forceinline__ int worker_warp_id() {
+  return worker_thread_id() / 32;
+}
+
+static __device__ __forceinline__ int worker_lane_id() {
+  return worker_thread_id() & 31;
+}
+
+static __device__ __forceinline__ int worker_warpgroup_id() {
+  return worker_warp_id() >> 2;
+}
+
+// sync inside a warp group
+template <int GROUP_THREADS>
+static __device__ __forceinline__ void wg_sync(uint32_t barrier_id) {
+  // Partition CTA barrier IDs between groups by shifting by 8 (mod 16).
+  // This works with the 0..15 barrier-id space and keeps group0/group1 disjoint.
+  uint32_t gid = static_cast<uint32_t>(worker_group_id());
+  barrier_id = (barrier_id + (gid << 3)) & 0xF;
+  asm volatile("bar.sync %0, %1;\n" ::"r"(barrier_id), "n"(GROUP_THREADS));
+}
 
 } // namespace kernel

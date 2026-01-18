@@ -71,10 +71,10 @@ __device__ __forceinline__ void
   constexpr int log2_NUM_WARPS_N = log2_constexpr(NUM_WARPS_N);
   constexpr int log2_NUM_ITERS_K = log2_constexpr(NUM_ITERS_K);
 
-  int warp_idx = warp_id();
+  int warp_idx = worker_warp_id();
   int warp_row = warp_idx >> log2_NUM_WARPS_N;
   int warp_col = warp_idx & (NUM_WARPS_N - 1);
-  int lane_idx = lane_id();
+  int lane_idx = worker_lane_id();
 
   T const *__restrict__ d_input = static_cast<T const *>(input_ptr);
   T const *__restrict__ d_mul =
@@ -136,25 +136,32 @@ __device__ __forceinline__ void
       sizeof(T) * NUM_WARPS_K * BATCH_SIZE * OUTPUT_ATOM_SIZE;
   // sizeof(T) * BATCH_SIZE * OUTPUT_ATOM_SIZE
 
+  constexpr size_t SMEM_PER_GROUP =
+      ((SHARED_OUTPUT_OFFSET + sizeof(T) * BATCH_SIZE * OUTPUT_ATOM_SIZE + 127) /
+       128) *
+      128;
+  char *smem_g =
+      smem + static_cast<size_t>(worker_group_id()) * SMEM_PER_GROUP;
+
   // zero buffer
-  T *zero_buf = (T *)(smem + ZERO_BUFFER_OFFSET);
+  T *zero_buf = (T *)(smem_g + ZERO_BUFFER_OFFSET);
   vec_zero_t<T, 8>::fill_zero(zero_buf);
 
   // copy
-  T *shared_input_buffer = (T *)(smem + SHARED_INPUT_BUFFER_OFFSET);
-  T *shared_mul_buffer = (T *)(smem + SHARED_MUL_BUFFER_OFFSET);
-  T *shared_weight_buffer = (T *)(smem + SHARED_WEIGHT_BUFFER_OFFSET);
+  T *shared_input_buffer = (T *)(smem_g + SHARED_INPUT_BUFFER_OFFSET);
+  T *shared_mul_buffer = (T *)(smem_g + SHARED_MUL_BUFFER_OFFSET);
+  T *shared_weight_buffer = (T *)(smem_g + SHARED_WEIGHT_BUFFER_OFFSET);
 
   // residual
   T *shared_residual =
-      residual ? (T *)(smem + SHARED_RESIDUAL_OFFSET) : nullptr;
+      residual ? (T *)(smem_g + SHARED_RESIDUAL_OFFSET) : nullptr;
 
   // intermidiate
-  T *silu_mul_output = (T *)(smem + SILU_MUL_OUTPUT_OFFSET);
-  T *mm_intermediate = (T *)(smem + MM_INTERMEDIATE_OFFSET);
+  T *silu_mul_output = (T *)(smem_g + SILU_MUL_OUTPUT_OFFSET);
+  T *mm_intermediate = (T *)(smem_g + MM_INTERMEDIATE_OFFSET);
 
   // out
-  T *shared_output = (T *)(smem + SHARED_OUTPUT_OFFSET);
+  T *shared_output = (T *)(smem_g + SHARED_OUTPUT_OFFSET);
 
   // define the swizzle mode
   using ZeroBufferSmem = smem_row<T, 0, 0, 0, 1, 8, 8>;
@@ -203,7 +210,7 @@ __device__ __forceinline__ void
 
     if (residual) {
 #pragma unroll
-      for (int i = threadIdx.x; i < NUM_CHUNKS_C; i += NUM_THREADS) {
+      for (int i = worker_thread_id(); i < NUM_CHUNKS_C; i += NUM_THREADS) {
         int row = i >> log2_CHUNKS_PER_ROW_C;
         int col = (i & (CHUNKS_PER_ROW_C - 1)) << log2_CHUNK_SIZE;
         load_smem(residual_smem(row, col), residual_dmem(row, col));
@@ -213,7 +220,7 @@ __device__ __forceinline__ void
 #pragma unroll
     for (int k_pipe = 0; k_pipe < K_PIPE_MAX - 1; k_pipe++) {
 #pragma unroll
-      for (int i = threadIdx.x; i < NUM_CHUNKS_A; i += NUM_THREADS) {
+      for (int i = worker_thread_id(); i < NUM_CHUNKS_A; i += NUM_THREADS) {
         int src_row = i >> log2_CHUNKS_PER_ROW_A;
         int dst_row = src_row + ((k_pipe + 1) * BATCH_SIZE);
         int dst_col = (i & (CHUNKS_PER_ROW_A - 1)) << log2_CHUNK_SIZE;
@@ -224,7 +231,7 @@ __device__ __forceinline__ void
                   mul_dmem(src_row, src_col));
       }
 #pragma unroll
-      for (int i = threadIdx.x; i < NUM_CHUNKS_B; i += NUM_THREADS) {
+      for (int i = worker_thread_id(); i < NUM_CHUNKS_B; i += NUM_THREADS) {
         int dst_row = (i & (CHUNKS_PER_COL_B - 1)) << log2_CHUNK_SIZE;
         int src_row = dst_row + (k_pipe << log2_constexpr(TILE_SIZE));
         int src_col = i >> log2_CHUNKS_PER_COL_B;
@@ -249,7 +256,7 @@ __device__ __forceinline__ void
       // copy
       if (for_idx + K_PIPE_MAX - 1 < FORLOOP_RANGE) {
 #pragma unroll
-        for (int i = threadIdx.x; i < NUM_CHUNKS_A; i += NUM_THREADS) {
+        for (int i = worker_thread_id(); i < NUM_CHUNKS_A; i += NUM_THREADS) {
           int row = i >> log2_CHUNKS_PER_ROW_A;
           int dst_col = (i & (CHUNKS_PER_ROW_A - 1)) << log2_CHUNK_SIZE;
           int src_col = dst_col + ((for_idx + K_PIPE_MAX - 1)
@@ -258,7 +265,7 @@ __device__ __forceinline__ void
           load_smem(mul_buffer_smem(row, dst_col), mul_dmem(row, src_col));
         }
 #pragma unroll
-        for (int i = threadIdx.x; i < NUM_CHUNKS_B; i += NUM_THREADS) {
+        for (int i = worker_thread_id(); i < NUM_CHUNKS_B; i += NUM_THREADS) {
           int dst_row = (i & (CHUNKS_PER_COL_B - 1)) << log2_CHUNK_SIZE;
           int src_row = dst_row + ((for_idx + K_PIPE_MAX - 1)
                                    << log2_constexpr(TILE_SIZE));
@@ -289,17 +296,17 @@ __device__ __forceinline__ void
       weight_smem.set_ptr(shared_weight_buffer +
                           TILE_SIZE * OUTPUT_ATOM_SIZE *
                               ((for_idx + 1) % K_PIPE_MAX));
-      __syncthreads();
+      wg_sync<WORKER_NUM_THREADS>(0);
 
       // fuse SiLU and mul
 #pragma unroll
-      for (int i = threadIdx.x; i < BATCH_SIZE * TILE_SIZE; i += NUM_THREADS) {
+      for (int i = worker_thread_id(); i < BATCH_SIZE * TILE_SIZE; i += NUM_THREADS) {
         float input_val = float(input_smem.at(i));
         T mul_val = mul_smem.at(i);
         silu_mul_output_smem.at(i) =
             T(input_val * (1.0f / (1.0f + expf(-input_val)))) * mul_val;
       }
-      __syncthreads();
+      wg_sync<WORKER_NUM_THREADS>(0);
 
       uint32_t a_frag[4], b_frag[4];
       for (uint32_t m = 0; m < NUM_ITERS_M; m++) {
@@ -324,7 +331,7 @@ __device__ __forceinline__ void
           }
         }
       }
-      __syncthreads();
+      wg_sync<WORKER_NUM_THREADS>(0);
     }
 
     // write back to shared memory
@@ -345,17 +352,17 @@ __device__ __forceinline__ void
         }
       }
     }
-    __syncthreads();
+    wg_sync<WORKER_NUM_THREADS>(0);
 
     if (NUM_WARPS_K > 1) {
       reduction_sum_row<decltype(output_smem), decltype(mm_intermediate_smem)>(
           output_smem, mm_intermediate_smem);
-      __syncthreads();
+      wg_sync<WORKER_NUM_THREADS>(0);
     }
 
 #pragma unroll
     for (int row = 0; row < BATCH_SIZE; row++) {
-      for (int i = threadIdx.x; i < OUTPUT_SIZE; i += NUM_THREADS) {
+      for (int i = worker_thread_id(); i < OUTPUT_SIZE; i += NUM_THREADS) {
         T val = NUM_WARPS_K > 1 ? output_smem.at(row, i)
                                 : mm_intermediate_smem.at(row, i);
         output_dmem.at(row, i) =
@@ -363,7 +370,7 @@ __device__ __forceinline__ void
       }
     }
     if (output_atom_idx + 1 < NUM_OUTPUT_ATOMS) {
-      __syncthreads();
+      wg_sync<WORKER_NUM_THREADS>(0);
     }
   }
 }

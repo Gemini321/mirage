@@ -89,8 +89,8 @@ __device__ __forceinline__ void
   constexpr int NUM_ITERS_M =
       1; // TODO: Batch size more than 16 will cause error
 
-  int warp_idx = warp_id();
-  int lane_idx = lane_id();
+  int warp_idx = worker_warp_id();
+  int lane_idx = worker_lane_id();
 
   T const *__restrict__ d_input = static_cast<T const *>(input_ptr);
   T const *__restrict__ d_norm_weight = static_cast<T const *>(norm_weight_ptr);
@@ -153,25 +153,31 @@ __device__ __forceinline__ void
   constexpr size_t SHARED_OUTPUT_OFFSET = MM_INTERMEDIATE_OFFSET;
   // reuse mm_intermediate
 
+  constexpr size_t SMEM_PER_GROUP =
+      ((REDUCTION_OUTPUT_OFFSET + sizeof(T) * BATCH_SIZE + 127) / 128) * 128;
+  char *smem_g =
+      smem + static_cast<size_t>(worker_group_id()) * SMEM_PER_GROUP;
+
   // zero buffer
-  T *zero_buf = (T *)(smem + ZERO_BUFFER_OFFSET);
+  T *zero_buf = (T *)(smem_g + ZERO_BUFFER_OFFSET);
   vec_zero_t<T, 8>::fill_zero(zero_buf);
 
   // copy
-  T *shared_input_buffer = (T *)(smem + SHARED_INPUT_BUFFER_OFFSET);
-  T *shared_norm_weight_buffer = (T *)(smem + SHARED_NORM_WEIGHT_BUFFER_OFFSET);
-  T *shared_weight_buffer = (T *)(smem + SHARED_WEIGHT_BUFFER_OFFSET);
+  T *shared_input_buffer = (T *)(smem_g + SHARED_INPUT_BUFFER_OFFSET);
+  T *shared_norm_weight_buffer =
+      (T *)(smem_g + SHARED_NORM_WEIGHT_BUFFER_OFFSET);
+  T *shared_weight_buffer = (T *)(smem_g + SHARED_WEIGHT_BUFFER_OFFSET);
 
   // intermediate
-  T *mul_output = (T *)(smem + MUL_OUTPUT_OFFSET);
-  T *element_unary_output = (T *)(smem + ELEMENT_UNARY_OUTPUT_OFFSET);
+  T *mul_output = (T *)(smem_g + MUL_OUTPUT_OFFSET);
+  T *element_unary_output = (T *)(smem_g + ELEMENT_UNARY_OUTPUT_OFFSET);
   clear_smem_buffer<T, BATCH_SIZE * TILE_SIZE>(element_unary_output);
-  T *mm_intermediate = (T *)(smem + MM_INTERMEDIATE_OFFSET);
-  T *mm_output = (T *)(smem + MM_OUTPUT_OFFSET);
-  T *reduction_output = (T *)(smem + REDUCTION_OUTPUT_OFFSET);
+  T *mm_intermediate = (T *)(smem_g + MM_INTERMEDIATE_OFFSET);
+  T *mm_output = (T *)(smem_g + MM_OUTPUT_OFFSET);
+  T *reduction_output = (T *)(smem_g + REDUCTION_OUTPUT_OFFSET);
 
   // output
-  T *shared_output = (T *)(smem + SHARED_OUTPUT_OFFSET);
+  T *shared_output = (T *)(smem_g + SHARED_OUTPUT_OFFSET);
 
   // define the swizzle mode
   using ZeroBufferSmem = smem_row<T, 0, 0, 0, 1, 8, 8>;
@@ -241,7 +247,7 @@ __device__ __forceinline__ void
         for (int k_pipe = 0; k_pipe < K_PIPE_MAX - 1; k_pipe++) {
           if (output_atom_idx == 0) {
 #pragma unroll
-            for (int i = threadIdx.x; i < NUM_CHUNKS_A; i += NUM_THREADS) {
+            for (int i = worker_thread_id(); i < NUM_CHUNKS_A; i += NUM_THREADS) {
               int input_src_row = i >> log2_CHUNKS_PER_ROW_A;
               int input_dst_row =
                   input_src_row +
@@ -262,7 +268,7 @@ __device__ __forceinline__ void
             }
           }
 #pragma unroll
-          for (int i = threadIdx.x; i < NUM_CHUNKS_B; i += NUM_THREADS) {
+          for (int i = worker_thread_id(); i < NUM_CHUNKS_B; i += NUM_THREADS) {
             int dst_row = (i & (CHUNKS_PER_COL_B - 1)) << log2_CHUNK_SIZE;
             int src_row = dst_row + (k_pipe << log2_constexpr(TILE_SIZE));
             int src_col = i >> log2_CHUNKS_PER_COL_B;
@@ -288,7 +294,7 @@ __device__ __forceinline__ void
           if (for_idx + K_PIPE_MAX - 1 < FORLOOP_RANGE) {
             if (output_atom_idx == 0) {
 #pragma unroll
-              for (int i = threadIdx.x; i < NUM_CHUNKS_A; i += NUM_THREADS) {
+              for (int i = worker_thread_id(); i < NUM_CHUNKS_A; i += NUM_THREADS) {
                 int input_src_row = i >> log2_CHUNKS_PER_ROW_A;
                 int input_dst_row =
                     input_src_row + ((for_idx + K_PIPE_MAX - 1) * BATCH_SIZE);
@@ -310,7 +316,7 @@ __device__ __forceinline__ void
               }
             }
 #pragma unroll
-            for (int i = threadIdx.x; i < NUM_CHUNKS_B; i += NUM_THREADS) {
+            for (int i = worker_thread_id(); i < NUM_CHUNKS_B; i += NUM_THREADS) {
               int dst_row = (i & (CHUNKS_PER_COL_B - 1)) << log2_CHUNK_SIZE;
               int src_row = dst_row + ((for_idx + K_PIPE_MAX - 1)
                                        << log2_constexpr(TILE_SIZE));
@@ -335,10 +341,10 @@ __device__ __forceinline__ void
           weight_smem.set_ptr(shared_weight_buffer +
                               TILE_SIZE * OUTPUT_ATOM_SIZE *
                                   ((for_idx + 1) % K_PIPE_MAX));
-          __syncthreads();
+          wg_sync<WORKER_NUM_THREADS>(0);
 
           mul_broadcast_row(mul_output_smem, input_smem, norm_weight_smem);
-          __syncthreads();
+          wg_sync<WORKER_NUM_THREADS>(0);
 
           uint32_t a_frag[4], b_frag[4];
           for (uint32_t m = 0; m < NUM_ITERS_M; m++) {
@@ -377,7 +383,7 @@ __device__ __forceinline__ void
                                                ElementUnaryOpType::MULSCALAR>(
                 element_unary_smem, input_smem, scalars);
           }
-          __syncthreads();
+          wg_sync<WORKER_NUM_THREADS>(0);
         }
 
         // write back to shared memory
@@ -400,13 +406,13 @@ __device__ __forceinline__ void
             }
           }
         }
-        __syncthreads();
+        wg_sync<WORKER_NUM_THREADS>(0);
 
         if (NUM_WARPS_K > 1) {
           reduction_sum_row<decltype(mm_output_smem),
                             decltype(mm_intermediate_smem)>(
               mm_output_smem, mm_intermediate_smem);
-          __syncthreads();
+          wg_sync<WORKER_NUM_THREADS>(0);
         }
 
         if (output_atom_idx == 0) {
@@ -417,7 +423,7 @@ __device__ __forceinline__ void
                             ElementUnaryOpType::ADDSCALAR,
                             ElementUnaryOpType::SQRT>(
               reduction_output_smem, element_unary_smem, scalars);
-          __syncthreads();
+          wg_sync<WORKER_NUM_THREADS>(0);
         }
 
         if (NUM_WARPS_K > 1) {
@@ -425,18 +431,18 @@ __device__ __forceinline__ void
         } else {
           div_col(output_smem, mm_intermediate_smem, reduction_output_smem);
         }
-        __syncthreads();
+        wg_sync<WORKER_NUM_THREADS>(0);
 
 #pragma unroll
         for (int row = 0; row < BATCH_SIZE; row++) {
 #pragma unroll
-          for (int i = threadIdx.x; i < OUTPUT_ATOM_SIZE; i += NUM_THREADS) {
+          for (int i = worker_thread_id(); i < OUTPUT_ATOM_SIZE; i += NUM_THREADS) {
             output_dmem.at(row, i) = output_smem.at(row, i);
           }
         }
         if (output_atom_idx + 1 <
             (NUM_OUTPUT_ATOMS + (LAST_OUTPUT_ATOM_SIZE > 0))) {
-          __syncthreads();
+          wg_sync<WORKER_NUM_THREADS>(0);
         }
       };
 

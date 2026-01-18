@@ -28,8 +28,9 @@ static __device__ __forceinline__ void reduction_sum_row(SMEM_DST dst,
   static_assert(SMEM_SRC::ROW % SMEM_DST::ROW == 0,
                 "Incompatible reduction dimensions");
 
-  for (int dst_elem_idx = threadIdx.x; dst_elem_idx < SMEM_DST::size();
-       dst_elem_idx += blockDim.x) {
+  int const tid = worker_thread_id();
+  for (int dst_elem_idx = tid; dst_elem_idx < SMEM_DST::size();
+       dst_elem_idx += NUM_THREADS) {
     float result = 0;
     int dst_row = dst_elem_idx / SMEM_DST::COL;
     int dst_col = dst_elem_idx % SMEM_DST::COL;
@@ -53,8 +54,9 @@ static __device__ __forceinline__ void reduction_sum_row_add(SMEM_DST dst,
   static_assert(SMEM_SRC::ROW % SMEM_DST::ROW == 0,
                 "Incompatible reduction dimensions");
 
-  for (int dst_elem_idx = threadIdx.x; dst_elem_idx < SMEM_DST::size();
-       dst_elem_idx += blockDim.x) {
+  int const tid = worker_thread_id();
+  for (int dst_elem_idx = tid; dst_elem_idx < SMEM_DST::size();
+       dst_elem_idx += NUM_THREADS) {
     float result = float(dst.at(dst_elem_idx));
     int dst_row = dst_elem_idx / SMEM_DST::COL;
     int dst_col = dst_elem_idx % SMEM_DST::COL;
@@ -78,8 +80,9 @@ template <typename SMEM_DST,
 static __device__ __forceinline__ void
     reduction_sum_row(SMEM_DST dst, SMEM_SRC src, float const *scalars) {
   static constexpr int REDUCTION_FACTOR = SMEM_SRC::ROW;
-  for (int dst_elem_idx = threadIdx.x; dst_elem_idx < SMEM_DST::size();
-       dst_elem_idx += blockDim.x) {
+  int const tid = worker_thread_id();
+  for (int dst_elem_idx = tid; dst_elem_idx < SMEM_DST::size();
+       dst_elem_idx += NUM_THREADS) {
     float result = 0;
     int dst_col = dst_elem_idx % SMEM_DST::COL;
 
@@ -98,8 +101,9 @@ template <typename T, typename SMEM_DST, typename SMEM_SRC>
 static __device__ __forceinline__ void reduction_sum_col(SMEM_DST dst,
                                                          SMEM_SRC src) {
   static constexpr int REDUCTION_FACTOR = SMEM_SRC::COL;
-  for (int dst_elem_idx = threadIdx.x; dst_elem_idx < SMEM_DST::size();
-       dst_elem_idx += blockDim.x) {
+  int const tid = worker_thread_id();
+  for (int dst_elem_idx = tid; dst_elem_idx < SMEM_DST::size();
+       dst_elem_idx += NUM_THREADS) {
     // TODO xinhaoc make this result float32
     float result = 0.0f;
     int dst_row = dst_elem_idx / SMEM_DST::COL;
@@ -120,8 +124,9 @@ template <typename T,
 static __device__ __forceinline__ void
     reduction_sum_col(SMEM_DST dst, SMEM_SRC src, float const *scalars) {
   static constexpr int REDUCTION_FACTOR = SMEM_SRC::COL;
-  for (int dst_elem_idx = threadIdx.x; dst_elem_idx < SMEM_DST::size();
-       dst_elem_idx += blockDim.x) {
+  int const tid = worker_thread_id();
+  for (int dst_elem_idx = tid; dst_elem_idx < SMEM_DST::size();
+       dst_elem_idx += NUM_THREADS) {
     // TODO xinhaoc make this result float32
     float result = 0.0f;
     int dst_row = dst_elem_idx / SMEM_DST::COL;
@@ -148,8 +153,8 @@ __device__ __forceinline__ void reduction_kernel(void const *input_ptr,
   T const *__restrict__ d_input = static_cast<T const *>(input_ptr);
   T const *__restrict__ d_buffer = static_cast<T const *>(buf_ptr);
   T *__restrict__ d_output = static_cast<T *>(output_ptr);
-  for (int idx = threadIdx.x; idx < OUTPUT_SIZE * BATCH_SIZE;
-       idx += blockDim.x) {
+  int const tid = worker_thread_id();
+  for (int idx = tid; idx < OUTPUT_SIZE * BATCH_SIZE; idx += NUM_THREADS) {
     float accum = 0.0;
     int batch = idx / OUTPUT_SIZE;
     int offset = idx % OUTPUT_SIZE;

@@ -33,35 +33,42 @@ template <typename T>
 __device__ __forceinline__ void block_reduce_max_idx(T &val, long long &idx) {
   // Align the shared memory to 128 bytes
   extern __shared__ char smem[];
+  int const group_id = worker_group_id();
+  int const tid = worker_thread_id();
+  int const lane = tid & 31;
+  int const warp = tid >> 5;
   long long *smem_idxs =
       (long long *)((reinterpret_cast<uintptr_t>(smem) + 127) / 128 * 128);
   T *smem_vals = reinterpret_cast<T *>(smem_idxs + 32); // max 32 warps
+  constexpr size_t SMEM_BYTES =
+      ((sizeof(long long) * 32 + sizeof(T) * 32 + 127) / 128) * 128;
+  char *smem_g = reinterpret_cast<char *>(smem_idxs) +
+                 static_cast<size_t>(group_id) * SMEM_BYTES;
+  smem_idxs = reinterpret_cast<long long *>(smem_g);
+  smem_vals = reinterpret_cast<T *>(smem_idxs + 32);
 
   warp_reduce_max_idx(val, idx);
 
-  int my_lane_id = lane_id();
-  int my_warp_id = warp_id();
-
-  if (my_lane_id == 0) {
-    smem_vals[my_warp_id] = val;
-    smem_idxs[my_warp_id] = idx;
+  if (lane == 0) {
+    smem_vals[warp] = val;
+    smem_idxs[warp] = idx;
   }
 
-  __syncthreads();
+  wg_sync<WORKER_NUM_THREADS>(0);
 
   // Only thread 0 holds the final result
-  if (my_warp_id == 0) {
+  if (warp == 0) {
     T block_max_val = T(-inf);
     long long block_max_idx = -1;
 
-    int num_warps = (blockDim.x + 31) >> log2_constexpr(NUM_THREADS_PER_WARP);
-    if (my_lane_id < num_warps) {
-      block_max_val = smem_vals[my_lane_id];
-      block_max_idx = smem_idxs[my_lane_id];
+    int num_warps = (NUM_THREADS + 31) >> log2_constexpr(NUM_THREADS_PER_WARP);
+    if (lane < num_warps) {
+      block_max_val = smem_vals[lane];
+      block_max_idx = smem_idxs[lane];
     }
     warp_reduce_max_idx(block_max_val, block_max_idx);
 
-    if (my_lane_id == 0) {
+    if (lane == 0) {
       val = block_max_val;
       idx = block_max_idx;
     }
@@ -78,7 +85,7 @@ __device__ __forceinline__ void
   T *__restrict__ output_val = static_cast<T *>(output_val_ptr);
   long long *__restrict__ output_idx = static_cast<long long *>(output_idx_ptr);
 
-  int tidx = threadIdx.x;
+  int tidx = worker_thread_id();
 
 // TODO: try vectorize
 #pragma unroll
@@ -117,7 +124,7 @@ __device__ __forceinline__ void
   long long *__restrict__ final_output =
       static_cast<long long *>(final_output_ptr);
 
-  int tidx = threadIdx.x;
+  int tidx = worker_thread_id();
 // TODO: try vectorize
 #pragma unroll
   for (int batch_idx = 0; batch_idx < num_active_tokens; batch_idx++) {
@@ -126,7 +133,7 @@ __device__ __forceinline__ void
     long long local_packed_idx = -1;
 
 #pragma unroll
-    for (int i = tidx; i < NUM_PARTIAL_TASKS; i += blockDim.x) {
+    for (int i = tidx; i < NUM_PARTIAL_TASKS; i += NUM_THREADS) {
       T current_val = partial_vals[i + batch_idx * NUM_PARTIAL_TASKS];
       if (current_val > local_max) {
         local_max = current_val;
