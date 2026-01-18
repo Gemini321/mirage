@@ -305,9 +305,6 @@ void register_mugraph(
       for (bid.x = 0; bid.x < bgraph.grid_dim.x; bid.x++) {
         for (bid.y = 0; bid.y < bgraph.grid_dim.y; bid.y++) {
           for (bid.z = 0; bid.z < bgraph.grid_dim.z; bid.z++) {
-      // for (bid.z = 0; bid.z < bgraph.grid_dim.z; bid.z++) {
-      //   for (bid.y = 0; bid.y < bgraph.grid_dim.y; bid.y++) {
-      //     for (bid.x = 0; bid.x < bgraph.grid_dim.x; bid.x++) {
             // event_desc_1 is the trigger_event of allgather
             EventDesc event_desc_1;
             event_desc_1.event_type = EVENT_LAUNCH_TASKS;

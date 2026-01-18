@@ -49,7 +49,7 @@ def max_factor_leq_n(m: int, n: int) -> int:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--use-mirage", action="store_true", help="Use Mirage kernels")
-    parser.add_argument("--max-num-batched-tokens", default=16, type=int, help="Max number of tokens in a batch")
+    parser.add_argument("--max-num-batched-tokens", default=8, type=int, help="Max number of tokens in a batch")
     parser.add_argument("--max-num-batched-requests", default=1, type=int, help="Max number of requests in a batch")
     parser.add_argument("--page-size", default=4096, type=int, help="Page size")
     parser.add_argument("--max-num-pages", default=16, type=int, help="Max num pages")
@@ -213,6 +213,8 @@ if __name__ == "__main__":
     position_embeddings = model.model.rotary_emb(positions)
 
     # get all model weight tensors
+    if args.max_num_batched_tokens >= 16:
+        assert args.max_num_batched_tokens % 16 == 0, "max_num_batched_tokens should be multiple of 16"
     input_tokens = torch.full((args.max_num_batched_tokens, 1), 0, dtype=torch.long, device="cuda")
     output_tokens = torch.full((args.max_num_batched_tokens, 1), 0, dtype=torch.long, device="cuda")
     prev_pos = 0
@@ -310,6 +312,7 @@ if __name__ == "__main__":
         
         # TODO: Make the code run well even if 96 % max_num_batched_tokens != 0
         # assert(96 % args.max_num_batched_tokens == 0)
+        split_batch_size = max(args.max_num_batched_tokens // 16, 1)
         
         x = mpk.attach_input(torch_tensor=input_tokens, name="input_token")
         cos_pos_embed = mpk.attach_input(
@@ -485,7 +488,7 @@ if __name__ == "__main__":
                 input=rmsnorm_out,
                 weight=w_qkv,
                 output=attn_in,
-                grid_dim=(grid_for_rmsnorm_linear_layer(w_qkv.dim(0), args.use_cutlass_kernel), 1, 1),
+                grid_dim=(grid_for_rmsnorm_linear_layer(w_qkv.dim(0), args.use_cutlass_kernel), split_batch_size, 1),
                 block_dim=(128, 1, 1),
             )
             #mpk.rmsnorm_linear_layer(
@@ -571,7 +574,7 @@ if __name__ == "__main__":
                 weight=w,
                 residual=x,
                 output=attn_proj_out,
-                grid_dim=(hidden_size // 64, 1, 1),
+                grid_dim=(hidden_size // 64, split_batch_size, 1),
                 block_dim=(128, 1, 1),
             )
             # reset residual input as x
@@ -615,7 +618,7 @@ if __name__ == "__main__":
                 input=rmsnorm_out,
                 weight=w_gatedup,
                 output=mlp_mid,
-                grid_dim=(rmsnorm_num_tasks, 1, 1),
+                grid_dim=(rmsnorm_num_tasks, split_batch_size, 1),
                 block_dim=(128, 1, 1),
             )
             #mpk.rmsnorm_linear_layer(
@@ -641,7 +644,7 @@ if __name__ == "__main__":
                 weight=w,
                 residual=x,
                 output=mlp_out,
-                grid_dim=(hidden_size // 64, 1, 1),
+                grid_dim=(hidden_size // 64, split_batch_size, 1),
                 block_dim=(128, 1, 1),
             )
             # reset residual input as x
@@ -672,7 +675,7 @@ if __name__ == "__main__":
             input=rmsnorm_out,
             weight=w_proj,
             output=argmax_in,
-            grid_dim=(mpk.num_workers, 1, 1),
+            grid_dim=(mpk.num_workers, split_batch_size, 1),
             block_dim=(128, 1, 1),
         )
         #mpk.rmsnorm_linear_layer(
