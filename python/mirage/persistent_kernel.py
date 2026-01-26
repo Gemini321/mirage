@@ -178,6 +178,7 @@ def get_compile_command(
     # flags = flags + [f"-DMPK_ENABLE_VERBOSE"]
     # flags = flags + [f"-DMIRAGE_ADMISSION_DEBUG"]
     # flags = flags + [f"-DMIRAGE_SCHED_LOG"]
+    # flags = flags + [f"-DMIRAGE_WORKER_LOG"]
 
     if use_nvshmem:
         nvshmem_cmd = [

@@ -46,6 +46,110 @@ def max_factor_leq_n(m: int, n: int) -> int:
         i += 1
     return max_factor
 
+
+def print_mirage_task_graph_summary(results_json,
+                                    model,
+                                    args,
+                                    mpk,
+                                    layer_summaries,
+                                    num_local_q_heads,
+                                    num_local_kv_heads,
+                                    head_dim):
+    from mirage.profiler_persistent import event_name_list
+
+    graph = json.loads(results_json)
+    task_counts = {}
+    for task in graph.get("all_tasks", []):
+        task_type = int(task.get("task_type", -1))
+        task_counts[task_type] = task_counts.get(task_type, 0) + 1
+    top = sorted(task_counts.items(), key=lambda x: (-x[1], x[0]))[:20]
+
+    hidden = model.config.hidden_size
+    intermediate = model.config.intermediate_size
+    max_tokens = mpk.max_num_batched_tokens
+    attention_mode = "split_kv" if args.split_kv_cache else "paged"
+
+    print("=== Mirage Task Graph Summary ===")
+    print(f"layers={model.config.num_hidden_layers} "
+          f"max_tokens={max_tokens} hidden={hidden} "
+          f"intermediate={intermediate} "
+          f"q_heads(local)={num_local_q_heads} "
+          f"kv_heads(local)={num_local_kv_heads} "
+          f"head_dim={head_dim}")
+    print(f"attention_mode={attention_mode}")
+    print("task_type counts (top 20):")
+    for task_type, count in top:
+        name = event_name_list.get(task_type, f"TASK_{task_type}")
+        print(f"  {name}: {count}")
+
+    for layer in layer_summaries:
+        idx = layer["index"]
+        if idx > 0:
+            break
+        print(f"\n[layer {idx}]")
+        print(f"  input: ({layer['batch']}, {hidden})")
+        print(f"  qkv:   ({layer['batch']}, {layer['qkv_n']})")
+        print(f"  attn:  ({layer['batch']}, {layer['attn_n']})")
+        print(f"  mlp:   gatedup=({layer['batch']}, {layer['gatedup_n']}) "
+              f"silu_out=({layer['batch']}, {layer['silu_n']})")
+
+        print(f"  qkv_proj: M={layer['batch']} K={hidden} N={layer['qkv_n']} "
+              f"({layer['batch']}x{hidden} @ {hidden}x{layer['qkv_n']} -> "
+              f"{layer['batch']}x{layer['qkv_n']}) "
+              f"tasks={layer['qkv_tasks']} (split_N = {layer['qkv_split']})")
+        print(f"    tasks: M={layer['batch_tile']} K={hidden} N={layer['qkv_tile_n']} "
+              f"({layer['batch_tile']}x{hidden} @ {hidden}x{layer['qkv_tile_n']} -> "
+              f"{layer['batch_tile']}x{layer['qkv_tile_n']}) "
+              f"x{layer['qkv_tasks']}")
+
+        print(f"  attention: tasks={layer['attn_tasks']} "
+              f"tiles={{({layer['batch']}, {layer['attn_tile_n']}): "
+              f"{layer['attn_tasks']}}}")
+        print(f"    tasks: out=({layer['batch']}, {layer['attn_tile_n']}) "
+              f"x{layer['attn_tasks']}")
+
+        print(f"  o_proj(+res): M={layer['batch']} K={layer['attn_n']} "
+              f"N={hidden} ({layer['batch']}x{layer['attn_n']} @ "
+              f"{layer['attn_n']}x{hidden} -> {layer['batch']}x{hidden}) "
+              f"tasks={layer['o_tasks']} (split_N = {layer['o_split']})")
+        print(f"    tasks: M={layer['batch_tile']} K={layer['attn_n']} "
+              f"N={layer['o_tile_n']} ({layer['batch_tile']}x{layer['attn_n']} @ "
+              f"{layer['attn_n']}x{layer['o_tile_n']} -> "
+              f"{layer['batch_tile']}x{layer['o_tile_n']}) "
+              f"x{layer['o_tasks']}")
+
+        print(f"  post_attn_rmsnorm: out=(1, {hidden}) tasks={layer['rms_tasks']}")
+        print(f"    tasks: out=(1, {hidden}) x{layer['rms_tasks']}")
+
+        print(f"  gatedup_proj: M={layer['batch']} K={hidden} "
+              f"N={layer['gatedup_n']} "
+              f"({layer['batch']}x{hidden} @ {hidden}x{layer['gatedup_n']} -> "
+              f"{layer['batch']}x{layer['gatedup_n']}) "
+              f"tasks={layer['gatedup_tasks']} (split_N = {layer['gatedup_split']})")
+        print(f"    tasks: M={layer['batch_tile']} K={hidden} "
+              f"N={layer['gatedup_tile_n']} "
+              f"({layer['batch_tile']}x{hidden} @ {hidden}x{layer['gatedup_tile_n']} -> "
+              f"{layer['batch_tile']}x{layer['gatedup_tile_n']}) "
+              f"x{layer['gatedup_tasks']}")
+
+        print(f"  silu_mul: out=({layer['batch']}, {layer['silu_n']}) "
+              f"tasks={layer['silu_tasks']}")
+        print(f"    tasks: out=({layer['batch']}, {layer['silu_tile_n']}) "
+              f"x{layer['silu_tasks']}")
+
+        print(f"  down_proj(+res): M={layer['batch']} K={layer['silu_n']} "
+              f"N={hidden} ({layer['batch']}x{layer['silu_n']} @ "
+              f"{layer['silu_n']}x{hidden} -> {layer['batch']}x{hidden}) "
+              f"tasks={layer['down_tasks']} (split_N = {layer['down_split']})")
+        print(f"    tasks: M={layer['batch_tile']} K={layer['silu_n']} "
+              f"N={layer['down_tile_n']} ({layer['batch_tile']}x{layer['silu_n']} @ "
+              f"{layer['silu_n']}x{layer['down_tile_n']} -> "
+              f"{layer['batch_tile']}x{layer['down_tile_n']}) "
+              f"x{layer['down_tasks']}")
+
+        print(f"  input_rmsnorm: out=(1, {hidden}) tasks={layer['rms_tasks']}")
+        print(f"    tasks: out=(1, {hidden}) x{layer['rms_tasks']}")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--use-mirage", action="store_true", help="Use Mirage kernels")
@@ -114,7 +218,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--prompt",
         type=str,
-        default="Give me a short introduction to large language model.",
+        default="Give me an introduction to large language model. Say as much as you can.",
         help="Custom prompt text to generate from.",
     )
 
@@ -454,6 +558,7 @@ if __name__ == "__main__":
             input_source=1,
         )
         x = y
+        layer_summaries = []
         for i, layer in enumerate(model.model.layers):
             # if i > 0:
             #     break
@@ -659,6 +764,64 @@ if __name__ == "__main__":
                 )
                 x = mlp_final
 
+            qkv_n = int(w_qkv.dim(0))
+            qkv_split = int(grid_for_rmsnorm_linear_layer(qkv_n, args.use_cutlass_kernel))
+            qkv_tile_n = qkv_n // qkv_split
+            qkv_tasks = qkv_split * split_batch_size
+            batch_tile = mpk.max_num_batched_tokens // split_batch_size
+
+            attn_tile_n = head_dim * (num_local_q_heads // num_local_kv_heads)
+            if args.split_kv_cache:
+                attn_tasks = mpk.max_num_batched_requests * num_local_kv_heads * num_kv_cache_chunks
+            elif spec_decode_config:
+                attn_tasks = 1 * num_local_kv_heads
+            else:
+                attn_tasks = mpk.max_num_batched_requests * num_local_kv_heads
+
+            o_split = hidden_size // 64
+            o_tasks = o_split * split_batch_size
+            o_tile_n = hidden_size // o_split
+
+            gatedup_n = int(w_gate_proj.dim(0) + w_up_proj.dim(0))
+            gatedup_split = int(rmsnorm_num_tasks)
+            gatedup_tasks = gatedup_split * split_batch_size
+            gatedup_tile_n = gatedup_n // gatedup_split
+
+            silu_n = int(w_gate_proj.dim(0))
+            silu_tasks = int(rmsnorm_num_tasks // 2)
+            silu_tile_n = silu_n // max(silu_tasks, 1)
+
+            down_split = hidden_size // 64
+            down_tasks = down_split * split_batch_size
+            down_tile_n = hidden_size // down_split
+
+            layer_summaries.append({
+                "index": i,
+                "batch": mpk.max_num_batched_tokens,
+                "batch_tile": batch_tile,
+                "qkv_n": qkv_n,
+                "qkv_split": qkv_split,
+                "qkv_tile_n": qkv_tile_n,
+                "qkv_tasks": qkv_tasks,
+                "attn_n": num_local_q_heads * head_dim,
+                "attn_tile_n": attn_tile_n,
+                "attn_tasks": attn_tasks,
+                "o_split": o_split,
+                "o_tile_n": o_tile_n,
+                "o_tasks": o_tasks,
+                "gatedup_n": gatedup_n,
+                "gatedup_split": gatedup_split,
+                "gatedup_tile_n": gatedup_tile_n,
+                "gatedup_tasks": gatedup_tasks,
+                "silu_n": silu_n,
+                "silu_tile_n": silu_tile_n,
+                "silu_tasks": silu_tasks,
+                "down_split": down_split,
+                "down_tile_n": down_tile_n,
+                "down_tasks": down_tasks,
+                "rms_tasks": mpk.max_num_batched_tokens,
+            })
+
         # add rmsnorm_linear layer
         w_norm = mpk.attach_input(
             torch_tensor=model.model.norm.weight, name="model_norm_weight"
@@ -723,6 +886,16 @@ if __name__ == "__main__":
             f.write(results["cuda_code"])
 
         mpk.compile(output_dir=args.output_dir)
+        print_mirage_task_graph_summary(
+            results["json_file"],
+            model,
+            args,
+            mpk,
+            layer_summaries,
+            num_local_q_heads,
+            num_local_kv_heads,
+            head_dim,
+        )
 
     # g = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()

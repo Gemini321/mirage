@@ -44,17 +44,19 @@ __device__ __forceinline__ void multitoken_paged_attention_task_impl(
     void const *sin_ptr,
     float q_eps,
     float k_eps) {
-  if constexpr ((MAX_TOKENS * NUM_QO_HEADS) <= 16) {
-    multitoken_paged_attention_task_impl_4_16<T,
-                                              NUM_QO_HEADS,
-                                              NUM_KV_HEADS,
-                                              KV_CACHE_STRIDE,
-                                              QKV_STRIDE,
-                                              O_STRIDE,
-                                              HEAD_DIM,
-                                              MAX_SEQ_LEN,
-                                              PAGE_SIZE,
-                                              MAX_TOKENS>(
+  constexpr int BLOCK_TOKENS = MAX_TOKENS < 16 ? MAX_TOKENS : 16;
+  if constexpr ((BLOCK_TOKENS * NUM_QO_HEADS) <= 16) {
+    if constexpr (MAX_TOKENS < 16) {
+      multitoken_paged_attention_task_impl_4_16<T,
+                                                NUM_QO_HEADS,
+                                                NUM_KV_HEADS,
+                                                KV_CACHE_STRIDE,
+                                                QKV_STRIDE,
+                                                O_STRIDE,
+                                                HEAD_DIM,
+                                                MAX_SEQ_LEN,
+                                                PAGE_SIZE,
+                                                MAX_TOKENS>(
         qkv_ptr,
         paged_k_cache_ptr,
         paged_v_cache_ptr,
@@ -72,8 +74,39 @@ __device__ __forceinline__ void multitoken_paged_attention_task_impl(
         sin_ptr,
         q_eps,
         k_eps);
-  } else if ((MAX_TOKENS * NUM_QO_HEADS) <= 64) {
-    multitoken_paged_attention_task_impl_32_64<T,
+    }
+    else {
+      multitoken_paged_attention_task_impl_4_16_blocked<T,
+                                                NUM_QO_HEADS,
+                                                NUM_KV_HEADS,
+                                                KV_CACHE_STRIDE,
+                                                QKV_STRIDE,
+                                                O_STRIDE,
+                                                HEAD_DIM,
+                                                MAX_SEQ_LEN,
+                                                PAGE_SIZE,
+                                                16>(
+        qkv_ptr,
+        paged_k_cache_ptr,
+        paged_v_cache_ptr,
+        output_ptr,
+        qo_indptr_buffer_ptr,
+        paged_kv_indptr_buffer_ptr,
+        paged_kv_indices_buffer_ptr,
+        paged_kv_last_page_len_buffer_ptr,
+        request_id,
+        qk_norm,
+        rope,
+        q_norm_weight_ptr,
+        k_norm_weight_ptr,
+        cos_ptr,
+        sin_ptr,
+        q_eps,
+        k_eps);
+    }
+  } else if constexpr ((BLOCK_TOKENS * NUM_QO_HEADS) <= 64) {
+    if constexpr (MAX_TOKENS < 16) {
+      multitoken_paged_attention_task_impl_32_64<T,
                                                NUM_QO_HEADS,
                                                NUM_KV_HEADS,
                                                KV_CACHE_STRIDE,
@@ -100,6 +133,39 @@ __device__ __forceinline__ void multitoken_paged_attention_task_impl(
         sin_ptr,
         q_eps,
         k_eps);
+    }
+    else {
+      multitoken_paged_attention_task_impl_32_64_blocked<T,
+                                               NUM_QO_HEADS,
+                                               NUM_KV_HEADS,
+                                               KV_CACHE_STRIDE,
+                                               QKV_STRIDE,
+                                               O_STRIDE,
+                                               HEAD_DIM,
+                                               MAX_SEQ_LEN,
+                                               PAGE_SIZE,
+                                               16>(
+        qkv_ptr,
+        paged_k_cache_ptr,
+        paged_v_cache_ptr,
+        output_ptr,
+        qo_indptr_buffer_ptr,
+        paged_kv_indptr_buffer_ptr,
+        paged_kv_indices_buffer_ptr,
+        paged_kv_last_page_len_buffer_ptr,
+        request_id,
+        qk_norm,
+        rope,
+        q_norm_weight_ptr,
+        k_norm_weight_ptr,
+        cos_ptr,
+        sin_ptr,
+        q_eps,
+        k_eps);
+    }
+  }
+  else {
+    static_assert((BLOCK_TOKENS * NUM_QO_HEADS) <= 64 && "Unsupported configuration for multitoken paged attention");
   }
 }
 } // namespace kernel

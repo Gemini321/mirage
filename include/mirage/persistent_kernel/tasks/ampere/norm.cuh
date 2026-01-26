@@ -32,8 +32,6 @@ __device__ __forceinline__ void rms_norm(InputSmem smem_input,
   if (rotary_emd) {
     static_assert(HEAD_DIM < NUM_THREADS || HEAD_DIM % NUM_THREADS == 0);
   }
-  constexpr int ROTARY_PARTICIPATING_THREADS =
-      (NUM_THREADS < HEAD_DIM ? NUM_THREADS : HEAD_DIM);
   // Use group-local barriers to keep 2-group execution safe.
 
   // smem_input: NUM_HEADS * (WINDOW_SIZE or CHUNK_SIZE), HEAD_DIM
