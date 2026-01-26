@@ -143,6 +143,11 @@ using namespace kernel;
 #define MIRAGE_SCHED_LOG 0
 #endif
 
+#ifndef MIRAGE_WORKER_LOG
+// Set `-DMIRAGE_WORKER_LOG=1` to enable worker task execution logging.
+#define MIRAGE_WORKER_LOG 0
+#endif
+
 #if MIRAGE_ADMISSION_DEBUG
 #define MIRAGE_ADMIT_DPRINTF(lane, fmt, ...)                                   \
   do {                                                                         \
@@ -1574,6 +1579,20 @@ __device__ __forceinline__ void execute_worker_multi_group_aligned(
     TaskId const task_id = slot_task_id[group_id];
     TaskDesc const *task_desc = &slot_task_desc[group_id];
 
+#if MIRAGE_WORKER_LOG
+    if (blockIdx.x == 0 && lane == 0 &&
+        task_desc->task_type == TASK_LINEAR_WITH_RESIDUAL) {
+      unsigned long long const task_pos =
+          (unsigned long long)get_task_position_index(task_id);
+      printf("[WORKER][EXEC] worker=%d group=%d task_pos=%llu task_type=%d variant=%u\n",
+             worker_id,
+             group_id,
+             task_pos,
+             static_cast<int>(task_desc->task_type),
+             static_cast<unsigned>(task_desc->variant_id));
+    }
+#endif
+
     if (task_id == 0ull) {
       if (lane == 0) {
 #if MIRAGE_ADMISSION_DEBUG
@@ -1992,83 +2011,6 @@ __device__ __forceinline__ void __mirage_sched_distribute_balanced_to_workers_wa
     unsigned long long first_task_pos,
     unsigned long long last_task_pos_exclusive);
 
-__device__ __forceinline__ void __mirage_sched_distribute_balanced_to_workers_single(
-    RuntimeConfig const &config,
-    size_t *next_free_pos,
-    int my_first_worker,
-    int my_last_worker,
-    unsigned long long iter_num,
-    unsigned long long first_task_pos,
-    unsigned long long last_task_pos_exclusive) {
-  unsigned long long total = 0;
-  if (last_task_pos_exclusive > first_task_pos) {
-    total = last_task_pos_exclusive - first_task_pos;
-  }
-  int const num_workers_this_sched = my_last_worker - my_first_worker;
-  if (num_workers_this_sched <= 0 || total == 0) {
-    return;
-  }
-
-  auto publish_one = [&](int worker_id, unsigned long long task_pos) {
-    size_t last_task_id = next_free_pos[worker_id - my_first_worker]++;
-    st_relaxed_gpu_u64(
-        &config.worker_queues[worker_id]
-                             [last_task_id % config.per_worker_queue_len],
-        compute_task_id(iter_num, task_pos));
-    atom_add_release_gpu_u64(
-        &config.worker_queue_last_ready_task_id[worker_id], 1);
-  };
-
-  if (total < static_cast<unsigned long long>(num_workers_this_sched)) {
-    for (unsigned long long t = 0; t < total; ++t) {
-      publish_one(my_first_worker + static_cast<int>(t), first_task_pos + t);
-    }
-    return;
-  }
-
-  if (total < static_cast<unsigned long long>(num_workers_this_sched * 2)) {
-    for (int w = 0; w < num_workers_this_sched; ++w) {
-      publish_one(my_first_worker + w,
-                  first_task_pos + static_cast<unsigned long long>(w));
-    }
-    unsigned long long rem =
-        total - static_cast<unsigned long long>(num_workers_this_sched);
-    for (unsigned long long w = 0; w < rem; ++w) {
-      publish_one(my_first_worker + static_cast<int>(w),
-                  first_task_pos +
-                      static_cast<unsigned long long>(num_workers_this_sched) +
-                      w);
-    }
-    return;
-  }
-
-  unsigned long long const base =
-      total / static_cast<unsigned long long>(num_workers_this_sched);
-  unsigned long long const base_even = (base / 2ull) * 2ull;
-  unsigned long long remaining =
-      total -
-      base_even * static_cast<unsigned long long>(num_workers_this_sched);
-  unsigned long long extra_pairs = remaining / 2ull;
-  unsigned long long extra_odd = remaining & 1ull;
-
-  unsigned long long cur = first_task_pos;
-  for (int w = 0; w < num_workers_this_sched; ++w) {
-    unsigned long long cnt = base_even;
-    if (extra_pairs > 0) {
-      cnt += 2ull;
-      extra_pairs -= 1ull;
-    } else if (extra_odd > 0) {
-      cnt += 1ull;
-      extra_odd = 0ull;
-    }
-    int const worker_id = my_first_worker + w;
-    for (unsigned long long t = 0; t < cnt; ++t) {
-      publish_one(worker_id, cur + t);
-    }
-    cur += cnt;
-  }
-}
-
 // Balanced scheduler variant based on execute_scheduler:
 // - If task_count < num_workers: strict round-robin (0/1 per worker).
 // - If num_workers <= task_count < 2*num_workers: one task each, then give the
@@ -2118,7 +2060,6 @@ __device__ __forceinline__ void execute_scheduler_balanced(RuntimeConfig config,
     }
 
     int next_begin_worker = my_first_worker;
-    int rr_start_worker = my_first_worker;
     int queue_idx = 0;
     while (true) {
       while (true) {
@@ -2238,19 +2179,30 @@ __device__ __forceinline__ void execute_scheduler_balanced(RuntimeConfig config,
               kernel_pos = (kernel_end > kernel_pos) ? kernel_end : (kernel_pos + 1);
               continue;
             }
-            unsigned long long start =
-                kernel_begin + static_cast<unsigned long long>(sched_index);
-            unsigned long long assigned = 0;
+            unsigned long long const total_tasks = kernel_end - kernel_begin;
+            unsigned long long const sched_chunk =
+                (total_tasks + static_cast<unsigned long long>(sched_count) - 1) /
+                static_cast<unsigned long long>(sched_count);
+            unsigned long long const sched_begin =
+                kernel_begin + sched_chunk * static_cast<unsigned long long>(sched_index);
+            unsigned long long const sched_end =
+                min(kernel_end, sched_begin + sched_chunk);
+            if (sched_begin >= sched_end) {
+              kernel_pos = kernel_end;
+              continue;
+            }
             size_t worker_counts[MAX_WORKER_PER_SCHEDULER] = {0};
-            for (unsigned long long task_pos = start;
-                 task_pos < kernel_end;
-                 task_pos += static_cast<unsigned long long>(sched_count)) {
-              int const worker_slot =
-                  (rr_start_worker - my_first_worker +
-                   static_cast<int>(assigned)) %
-                  num_workers_this_sched;
-              worker_counts[worker_slot] += 1;
-              assigned += 1;
+            unsigned long long const sched_tasks = sched_end - sched_begin;
+            unsigned long long const worker_chunk =
+                (sched_tasks + static_cast<unsigned long long>(num_workers_this_sched) - 1) /
+                static_cast<unsigned long long>(num_workers_this_sched);
+            for (int w = 0; w < num_workers_this_sched; ++w) {
+              unsigned long long const w_begin =
+                  sched_begin + worker_chunk * static_cast<unsigned long long>(w);
+              unsigned long long const w_end =
+                  min(sched_end, w_begin + worker_chunk);
+              worker_counts[w] =
+                  (w_end > w_begin) ? static_cast<size_t>(w_end - w_begin) : 0;
             }
             size_t worker_base[MAX_WORKER_PER_SCHEDULER] = {0};
             for (int w = 0; w < num_workers_this_sched; ++w) {
@@ -2263,20 +2215,23 @@ __device__ __forceinline__ void execute_scheduler_balanced(RuntimeConfig config,
             for (int w = 0; w < num_workers_this_sched; ++w) {
               worker_counts[w] = 0;
             }
-            assigned = 0;
-            for (unsigned long long task_pos = start;
-                 task_pos < kernel_end;
-                 task_pos += static_cast<unsigned long long>(sched_count)) {
-              int const worker_slot =
-                  (rr_start_worker - my_first_worker +
-                   static_cast<int>(assigned)) %
-                  num_workers_this_sched;
-              int const worker_id = my_first_worker + worker_slot;
-              size_t const last_task_id =
-                  worker_base[worker_slot] + worker_counts[worker_slot]++;
+            for (int w = 0; w < num_workers_this_sched; ++w) {
+              unsigned long long const w_begin =
+                  sched_begin + worker_chunk * static_cast<unsigned long long>(w);
+              unsigned long long const w_end =
+                  min(sched_end, w_begin + worker_chunk);
+              if (w_begin >= w_end) {
+                continue;
+              }
+              int const worker_id = my_first_worker + w;
+              size_t const base = worker_base[w];
+              for (unsigned long long task_pos = w_begin; task_pos < w_end;
+                   ++task_pos) {
+                size_t const last_task_id = base + worker_counts[w]++;
 #if MIRAGE_SCHED_LOG
               {
                 TaskDesc const &desc = config.all_tasks[task_pos];
+                if (desc.task_type == TASK_LINEAR_WITH_RESIDUAL && sched_id == 0) {
                 TaskId const task_id =
                     compute_task_id(iteration_num, task_pos);
                 unsigned long long const task_in_evt =
@@ -2293,25 +2248,26 @@ __device__ __forceinline__ void execute_scheduler_balanced(RuntimeConfig config,
                        (unsigned long long)task_pos,
                        (unsigned long long)task_in_evt,
                        worker_id);
-                if (sched_id == 0) {
-                  printf("[%d][SCHD] EVENT_LAUNCH_DEPENDENT_TASKS schd_id(%d) "
-                         "iter_num(%llu) task_pos(%llu) "
-                         "worker_id(%d) "
-                         "worker_last_ready_pos(%llu)"
-                         "event_id(%llu)"
-                         "total_event_range(%llu-%llu)"
-                         "my_event_range(%llu-%llu)\n",
-                         config.my_gpu_id,
-                         sched_id,
-                         (unsigned long long)iteration_num,
-                         (unsigned long long)task_pos,
-                         worker_id,
-                         (unsigned long long)(last_task_id + 1),
-                         (unsigned long long)event_id,
-                         (unsigned long long)e.first_task_id,
-                         (unsigned long long)e.last_task_id,
-                         (unsigned long long)my_first_task,
-                         (unsigned long long)my_last_task);
+                // if (sched_id == 0) {
+                //   printf("[%d][SCHD] EVENT_LAUNCH_DEPENDENT_TASKS schd_id(%d) "
+                //          "iter_num(%llu) task_pos(%llu) "
+                //          "worker_id(%d) "
+                //          "worker_last_ready_pos(%llu)"
+                //          "event_id(%llu)"
+                //          "total_event_range(%llu-%llu)"
+                //          "my_event_range(%llu-%llu)\n",
+                //          config.my_gpu_id,
+                //          sched_id,
+                //          (unsigned long long)iteration_num,
+                //          (unsigned long long)task_pos,
+                //          worker_id,
+                //          (unsigned long long)(last_task_id + 1),
+                //          (unsigned long long)event_id,
+                //          (unsigned long long)e.first_task_id,
+                //          (unsigned long long)e.last_task_id,
+                //          (unsigned long long)my_first_task,
+                //          (unsigned long long)my_last_task);
+                // }
                 }
               }
 #endif
@@ -2320,7 +2276,7 @@ __device__ __forceinline__ void execute_scheduler_balanced(RuntimeConfig config,
                                        [last_task_id %
                                         config.per_worker_queue_len],
                   compute_task_id(iteration_num, task_pos));
-              assigned += 1;
+              }
             }
             for (int w = 0; w < num_workers_this_sched; ++w) {
               if (worker_counts[w] == 0) {
@@ -2329,13 +2285,6 @@ __device__ __forceinline__ void execute_scheduler_balanced(RuntimeConfig config,
               atom_add_release_gpu_u64(
                   &config.worker_queue_last_ready_task_id[my_first_worker + w],
                   worker_counts[w]);
-            }
-            if (assigned > 0) {
-              rr_start_worker =
-                  my_first_worker +
-                  ((rr_start_worker - my_first_worker +
-                    static_cast<int>(assigned)) %
-                   num_workers_this_sched);
             }
             kernel_pos = kernel_end;
           }
@@ -2389,19 +2338,30 @@ __device__ __forceinline__ void execute_scheduler_balanced(RuntimeConfig config,
               kernel_pos = (kernel_end > kernel_pos) ? kernel_end : (kernel_pos + 1);
               continue;
             }
-            unsigned long long start =
-                kernel_begin + static_cast<unsigned long long>(sched_index);
-            unsigned long long assigned = 0;
+            unsigned long long const total_tasks = kernel_end - kernel_begin;
+            unsigned long long const sched_chunk =
+                (total_tasks + static_cast<unsigned long long>(sched_count) - 1) /
+                static_cast<unsigned long long>(sched_count);
+            unsigned long long const sched_begin =
+                kernel_begin + sched_chunk * static_cast<unsigned long long>(sched_index);
+            unsigned long long const sched_end =
+                min(kernel_end, sched_begin + sched_chunk);
+            if (sched_begin >= sched_end) {
+              kernel_pos = kernel_end;
+              continue;
+            }
             size_t worker_counts[MAX_WORKER_PER_SCHEDULER] = {0};
-            for (unsigned long long task_pos = start;
-                 task_pos < kernel_end;
-                 task_pos += static_cast<unsigned long long>(sched_count)) {
-              int const worker_slot =
-                  (rr_start_worker - my_first_worker +
-                   static_cast<int>(assigned)) %
-                  num_workers_this_sched;
-              worker_counts[worker_slot] += 1;
-              assigned += 1;
+            unsigned long long const sched_tasks = sched_end - sched_begin;
+            unsigned long long const worker_chunk =
+                (sched_tasks + static_cast<unsigned long long>(num_workers_this_sched) - 1) /
+                static_cast<unsigned long long>(num_workers_this_sched);
+            for (int w = 0; w < num_workers_this_sched; ++w) {
+              unsigned long long const w_begin =
+                  sched_begin + worker_chunk * static_cast<unsigned long long>(w);
+              unsigned long long const w_end =
+                  min(sched_end, w_begin + worker_chunk);
+              worker_counts[w] =
+                  (w_end > w_begin) ? static_cast<size_t>(w_end - w_begin) : 0;
             }
             size_t worker_base[MAX_WORKER_PER_SCHEDULER] = {0};
             for (int w = 0; w < num_workers_this_sched; ++w) {
@@ -2414,20 +2374,23 @@ __device__ __forceinline__ void execute_scheduler_balanced(RuntimeConfig config,
             for (int w = 0; w < num_workers_this_sched; ++w) {
               worker_counts[w] = 0;
             }
-            assigned = 0;
-            for (unsigned long long task_pos = start;
-                 task_pos < kernel_end;
-                 task_pos += static_cast<unsigned long long>(sched_count)) {
-              int const worker_slot =
-                  (rr_start_worker - my_first_worker +
-                   static_cast<int>(assigned)) %
-                  num_workers_this_sched;
-              int const worker_id = my_first_worker + worker_slot;
-              size_t const last_task_id =
-                  worker_base[worker_slot] + worker_counts[worker_slot]++;
+            for (int w = 0; w < num_workers_this_sched; ++w) {
+              unsigned long long const w_begin =
+                  sched_begin + worker_chunk * static_cast<unsigned long long>(w);
+              unsigned long long const w_end =
+                  min(sched_end, w_begin + worker_chunk);
+              if (w_begin >= w_end) {
+                continue;
+              }
+              int const worker_id = my_first_worker + w;
+              size_t const base = worker_base[w];
+              for (unsigned long long task_pos = w_begin; task_pos < w_end;
+                   ++task_pos) {
+                size_t const last_task_id = base + worker_counts[w]++;
 #if MIRAGE_SCHED_LOG
               {
                 TaskDesc const &desc = config.all_tasks[task_pos];
+                if (desc.task_type == TASK_LINEAR_WITH_RESIDUAL) {
                 TaskId const task_id =
                     compute_task_id(iteration_num, task_pos);
                 unsigned long long const task_in_evt =
@@ -2444,6 +2407,7 @@ __device__ __forceinline__ void execute_scheduler_balanced(RuntimeConfig config,
                        (unsigned long long)task_pos,
                        (unsigned long long)task_in_evt,
                        worker_id);
+                }
               }
 #endif
               st_relaxed_gpu_u64(
@@ -2451,7 +2415,7 @@ __device__ __forceinline__ void execute_scheduler_balanced(RuntimeConfig config,
                                        [last_task_id %
                                         config.per_worker_queue_len],
                   compute_task_id(iteration_num, task_pos));
-              assigned += 1;
+              }
             }
             for (int w = 0; w < num_workers_this_sched; ++w) {
               if (worker_counts[w] == 0) {
@@ -2460,13 +2424,6 @@ __device__ __forceinline__ void execute_scheduler_balanced(RuntimeConfig config,
               atom_add_release_gpu_u64(
                   &config.worker_queue_last_ready_task_id[my_first_worker + w],
                   worker_counts[w]);
-            }
-            if (assigned > 0) {
-              rr_start_worker =
-                  my_first_worker +
-                  ((rr_start_worker - my_first_worker +
-                    static_cast<int>(assigned)) %
-                   num_workers_this_sched);
             }
             kernel_pos = kernel_end;
           }
@@ -2522,30 +2479,6 @@ __device__ __forceinline__ void __mirage_sched_publish_tasks_to_worker_warp(
   if (lane == 0) {
     atom_add_release_gpu_u64(&config.worker_queue_last_ready_task_id[worker_id],
                              task_count);
-  }
-  __syncwarp();
-}
-
-__device__ __forceinline__ void __mirage_sched_publish_terminate_to_worker_warp(
-    RuntimeConfig const &config,
-    size_t *next_free_pos,
-    int lane,
-    int my_first_worker,
-    int worker_id) {
-  unsigned long long base_slot = 0;
-  int const worker_slot = worker_id - my_first_worker;
-  if (lane == 0) {
-    base_slot = next_free_pos[worker_slot];
-    next_free_pos[worker_slot] = base_slot + 1ull;
-  }
-  base_slot = __shfl_sync(0xffffffff, base_slot, 0);
-  if (lane == 0) {
-    TaskId *q = config.worker_queues[worker_id];
-    unsigned long long const qlen =
-        static_cast<unsigned long long>(config.per_worker_queue_len);
-    st_relaxed_gpu_u64(&q[base_slot % qlen], 0ull);
-    atom_add_release_gpu_u64(&config.worker_queue_last_ready_task_id[worker_id],
-                             1ull);
   }
   __syncwarp();
 }
@@ -2649,192 +2582,6 @@ __device__ __forceinline__ void __mirage_sched_distribute_balanced_to_workers_wa
                                                   cur,
                                                   cnt);
       cur += cnt;
-    }
-  }
-}
-
-__device__ __forceinline__ void execute_scheduler_xx(RuntimeConfig config,
-                                                     int offset) {
-  int const num_schedulers =
-      config.num_local_schedulers + config.num_remote_schedulers;
-  int const lane = threadIdx.x & 31;
-  int const sched_id = blockIdx.x + offset;
-  size_t iteration_num = 0;
-  EventId *sched_queue0 = config.sched_queues[sched_id];
-  int sched_queue_id0 = sched_id;
-  EventId *sched_queue1 = nullptr;
-  int sched_queue_id1 = -1;
-  bool has_queue1 = false;
-  unsigned long long int my_first_worker, my_last_worker;
-
-  if (sched_id < config.num_local_schedulers) {
-    sched_queue1 = config.sched_queues[num_schedulers];
-    sched_queue_id1 = num_schedulers;
-    has_queue1 = true;
-    get_first_last_ids(config.num_workers,
-                       config.num_local_schedulers,
-                       sched_id,
-                       &my_first_worker,
-                       &my_last_worker);
-  } else {
-    get_first_last_ids(config.num_workers,
-                       config.num_remote_schedulers,
-                       sched_id - config.num_local_schedulers,
-                       &my_first_worker,
-                       &my_last_worker);
-    my_first_worker += config.num_workers;
-    my_last_worker += config.num_workers;
-  }
-
-  size_t cur_event_pos0 = 0, last_event_pos0 = 0;
-  size_t cur_event_pos1 = 0, last_event_pos1 = 0;
-  int next_begin_worker = static_cast<int>(my_first_worker);
-
-  __shared__ size_t worker_queue_next_free_task_pos[MAX_WORKER_PER_SCHEDULER];
-  if (lane == 0) {
-    int const num_workers_this_sched =
-        static_cast<int>(my_last_worker - my_first_worker);
-    for (int i = 0; i < num_workers_this_sched; i++) {
-      worker_queue_next_free_task_pos[i] = 0;
-    }
-  }
-  __syncwarp();
-
-  int queue_idx = 0;
-  while (true) {
-    while (true) {
-      if (queue_idx == 0) {
-        if (cur_event_pos0 != last_event_pos0) {
-          break;
-        }
-        last_event_pos0 = ld_acquire_gpu_u64(
-            &config.sched_queue_last_ready_event_id[sched_queue_id0]);
-        if (cur_event_pos0 < last_event_pos0) {
-          break;
-        }
-        if (has_queue1) {
-          queue_idx = 1;
-        }
-      } else {
-        if (cur_event_pos1 != last_event_pos1) {
-          break;
-        }
-        last_event_pos1 = ld_acquire_gpu_u64(
-            &config.sched_queue_last_ready_event_id[sched_queue_id1]);
-        if (cur_event_pos1 < last_event_pos1) {
-          break;
-        }
-        queue_idx = 0;
-      }
-      __nanosleep(10);
-    }
-
-    size_t cur_event_pos = (queue_idx == 0) ? cur_event_pos0 : cur_event_pos1;
-    size_t last_event_pos = (queue_idx == 0) ? last_event_pos0 : last_event_pos1;
-    assert(cur_event_pos + config.per_sched_queue_len > last_event_pos);
-
-    EventId *sched_queue = (queue_idx == 0) ? sched_queue0 : sched_queue1;
-    EventId event_id = ld_relaxed_gpu_u64(
-        &sched_queue[cur_event_pos % config.per_sched_queue_len]);
-    if (is_termination_event(event_id)) {
-      if (sched_id < config.num_local_schedulers) {
-        for (int w = static_cast<int>(my_first_worker);
-             w < static_cast<int>(my_last_worker);
-             ++w) {
-          __mirage_sched_publish_terminate_to_worker_warp(
-              config,
-              worker_queue_next_free_task_pos,
-              lane,
-              static_cast<int>(my_first_worker),
-              w);
-        }
-      }
-      return;
-    }
-
-    EventDesc const &e = config.all_events[event_id];
-    if (e.event_type == EVENT_END_OF_TASK_GRAPH) {
-#ifdef MODE_ONEPASS
-      bool const continue_running = (iteration_num == 0);
-#else
-      bool const continue_running = prepare_next_batch(config);
-#endif
-      if (!continue_running) {
-        terminate_schedulers(config);
-      } else {
-        int worker_id = static_cast<int>(my_first_worker);
-        if (lane == 0) {
-          worker_id = next_begin_worker;
-          if (next_begin_worker + 1 >= static_cast<int>(my_last_worker)) {
-            next_begin_worker = static_cast<int>(my_first_worker);
-          } else {
-            next_begin_worker++;
-          }
-        }
-        worker_id = __shfl_sync(0xffffffff, worker_id, 0);
-        __mirage_sched_publish_tasks_to_worker_warp(
-            config,
-            worker_queue_next_free_task_pos,
-            lane,
-            static_cast<int>(my_first_worker),
-            worker_id,
-            iteration_num + 1ull,
-            1ull /*begin_task_graph*/,
-            1ull);
-      }
-    } else if (e.event_type == EVENT_LAUNCH_DEPENDENT_TASKS) {
-      iteration_num = iteration_num + 1;
-      assert(sched_id < config.num_local_schedulers);
-      unsigned long long int split_first = 0, split_last = 0;
-      get_first_last_ids(e.last_task_id - e.first_task_id,
-                         config.num_local_schedulers,
-                         sched_id,
-                         &split_first,
-                         &split_last);
-      unsigned long long my_first_task =
-          split_first + static_cast<unsigned long long>(e.first_task_id);
-      unsigned long long my_last_task =
-          split_last + static_cast<unsigned long long>(e.first_task_id);
-      __mirage_sched_distribute_balanced_to_workers_warp(
-          config,
-          worker_queue_next_free_task_pos,
-          lane,
-          static_cast<int>(my_first_worker),
-          static_cast<int>(my_last_worker),
-          iteration_num,
-          my_first_task,
-          my_last_task);
-    } else {
-      unsigned long long my_first_task =
-          static_cast<unsigned long long>(e.first_task_id);
-      unsigned long long my_last_task =
-          static_cast<unsigned long long>(e.last_task_id);
-      if (e.event_type == EVENT_LAUNCH_MASSIVE_TASKS) {
-        assert(sched_id < config.num_local_schedulers);
-        unsigned long long int split_first = 0, split_last = 0;
-        get_first_last_ids(e.last_task_id - e.first_task_id,
-                           config.num_local_schedulers,
-                           sched_id,
-                           &split_first,
-                           &split_last);
-        my_first_task = split_first + static_cast<unsigned long long>(e.first_task_id);
-        my_last_task = split_last + static_cast<unsigned long long>(e.first_task_id);
-      }
-      __mirage_sched_distribute_balanced_to_workers_warp(
-          config,
-          worker_queue_next_free_task_pos,
-          lane,
-          static_cast<int>(my_first_worker),
-          static_cast<int>(my_last_worker),
-          iteration_num,
-          my_first_task,
-          my_last_task);
-    }
-
-    if (queue_idx == 0) {
-      cur_event_pos0 += 1;
-    } else {
-      cur_event_pos1 += 1;
     }
   }
 }
@@ -3150,8 +2897,8 @@ extern "C" void launch_persistent_kernel() {
   int num_schedulers = global_runtime_config.num_local_schedulers +
                        global_runtime_config.num_remote_schedulers;
 	  if (global_runtime_config.split_worker_scheduler) {
-    printf("worker kernel: %d & scheduler kernel: %d\n", global_runtime_config.num_workers, num_schedulers);
-    printf("smem size: %d\n", MAX_DYNAMIC_SHARED_MEMORY_SIZE);
+    // printf("worker kernel: %d & scheduler kernel: %d\n", global_runtime_config.num_workers, num_schedulers);
+    // printf("smem size: %d\n", MAX_DYNAMIC_SHARED_MEMORY_SIZE);
 	    int worker_threads = WORKER_NUM_THREADS;
 	    worker_threads = WORKER_NUM_THREADS * 2;
 	    // printf("worker threads: %d, scheduler threads: %d\n", worker_threads, 32);
