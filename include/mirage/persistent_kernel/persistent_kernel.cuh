@@ -546,14 +546,10 @@ __device__ __forceinline__ bool
         }
       }
       config.step[request_id] = step + num_tokens;
-#ifdef MPK_ENABLE_PROFILING
-      if (true) {
-#else
       if ((step + num_tokens + 1 >= config.max_seq_length) ||
           ((config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step +
                           num_tokens] == config.eos_token_id) &&
            (step + num_tokens >= prompt_len))) {
-#endif
         // Request is done
         config.request_ids[i] = -1;
         // Free pages
@@ -696,16 +692,12 @@ __device__ __forceinline__ bool
 #endif
   config.step[0] = step + config.new_token_nums[0];
 
-#ifdef MPK_ENABLE_PROFILING
-  return false;
-#else
   if ((step + 2 >= config.max_seq_length) ||
       (config.tokens[step + 1] == config.eos_token_id)) {
     return false;
   } else {
     return true;
   }
-#endif
 }
 #endif
 
@@ -1420,8 +1412,8 @@ __device__ __forceinline__ void execute_worker_multi_group_aligned(
   if (threadIdx.x == 0) {
     worker_queue = config.worker_queues[worker_id];
     worker_queue_id = worker_id;
-    next_task_pos[0] = 0;
-    next_task_pos[1] = 1;
+    next_task_pos[0] = 1;
+    next_task_pos[1] = 0;
     last_task_pos = 0;
     terminate_all = 0;
     task_exec_lock = 0;
@@ -1464,14 +1456,6 @@ __device__ __forceinline__ void execute_worker_multi_group_aligned(
     if (terminate_snapshot[group_id] != 0) {
       // Keep the existing "extra" exit-path barrier safe by making the branch
       // predicate converged (terminate_snapshot is lane0-owned).
-#ifdef MPK_ENABLE_PROFILING
-      if (lane == 0) {
-        local_task_counter = atomicAdd(&task_counter, 1u);
-        PROFILER_EVENT_START(TASK_WORKER_EXIT, local_task_counter);
-        __nanosleep(200);
-        PROFILER_EVENT_END(TASK_WORKER_EXIT, local_task_counter);
-      }
-#endif
 #if MIRAGE_ADMISSION_DEBUG
       if (lane == 0) {
         printf("[ADMIT][%d] worker=%d group=%d EXIT reason=terminate_all=1\n",
@@ -1498,13 +1482,17 @@ __device__ __forceinline__ void execute_worker_multi_group_aligned(
               &config.worker_queue_last_ready_task_id[worker_queue_id]));
           size_t cur = next_task_pos[group_id];
           if (cur < last) {
-#ifdef MPK_ENABLE_PROFILING
-            fetch_task_ev_no[group_id] = atomicAdd(&task_counter, 1u);
-            fetch_task_ev_active[group_id] = 1;
-            PROFILER_EVENT_START(TASK_GET_NEXT_TASK, fetch_task_ev_no[group_id]);
-#endif
             TaskId tid = ld_relaxed_gpu_u64(
                 &worker_queue[cur % config.per_worker_queue_len]);
+#ifdef MPK_ENABLE_PROFILING
+            unsigned long long const tid_iter = get_task_iteration_num(tid);
+            if (tid_iter == 10ull) {
+              fetch_task_ev_no[group_id] = atomicAdd(&task_counter, 1u);
+              fetch_task_ev_active[group_id] = 1;
+              PROFILER_EVENT_START(TASK_GET_NEXT_TASK,
+                                   fetch_task_ev_no[group_id]);
+            }
+#endif
             size_t tpos = get_task_position_index(tid);
             group_task_id[group_id] = tid;
             group_task_pos[group_id] = tpos;
@@ -1577,10 +1565,19 @@ __device__ __forceinline__ void execute_worker_multi_group_aligned(
     }
 
     TaskId const task_id = slot_task_id[group_id];
+    unsigned long long const task_iter = get_task_iteration_num(task_id);
     TaskDesc const *task_desc = &slot_task_desc[group_id];
+#ifdef MPK_ENABLE_PROFILING
+    int do_profile = 0;
+    if (lane == 0) {
+      if (task_iter == 10ull) {
+        do_profile = 1;
+      }
+    }
+#endif
 
 #if MIRAGE_WORKER_LOG
-    if (blockIdx.x == 0 && lane == 0 &&
+    if (blockIdx.x == 40 && lane == 0 &&
         task_desc->task_type == TASK_LINEAR_WITH_RESIDUAL) {
       unsigned long long const task_pos =
           (unsigned long long)get_task_position_index(task_id);
@@ -1604,10 +1601,12 @@ __device__ __forceinline__ void execute_worker_multi_group_aligned(
         atomicExch(&terminate_all, 1);
         atomicExch(&slot_state[group_id], 0);
 #ifdef MPK_ENABLE_PROFILING
-        local_task_counter = atomicAdd(&task_counter, 1u);
-        PROFILER_EVENT_START(TASK_WORKER_EXIT, local_task_counter);
-        __nanosleep(200);
-        PROFILER_EVENT_END(TASK_WORKER_EXIT, local_task_counter);
+        if (do_profile) {
+          local_task_counter = atomicAdd(&task_counter, 1u);
+          PROFILER_EVENT_START(TASK_WORKER_EXIT, local_task_counter);
+          __nanosleep(200);
+          PROFILER_EVENT_END(TASK_WORKER_EXIT, local_task_counter);
+        }
 #endif
       }
       wg_sync<WORKER_NUM_THREADS>(3);
@@ -1625,10 +1624,12 @@ __device__ __forceinline__ void execute_worker_multi_group_aligned(
         atomicExch(&terminate_all, 1);
         atomicExch(&slot_state[group_id], 0);
 #ifdef MPK_ENABLE_PROFILING
-        local_task_counter = atomicAdd(&task_counter, 1u);
-        PROFILER_EVENT_START(TASK_WORKER_EXIT, local_task_counter);
-        __nanosleep(200);
-        PROFILER_EVENT_END(TASK_WORKER_EXIT, local_task_counter);
+        if (do_profile) {
+          local_task_counter = atomicAdd(&task_counter, 1u);
+          PROFILER_EVENT_START(TASK_WORKER_EXIT, local_task_counter);
+          __nanosleep(200);
+          PROFILER_EVENT_END(TASK_WORKER_EXIT, local_task_counter);
+        }
 #endif
       }
       wg_sync<WORKER_NUM_THREADS>(3);
@@ -1671,7 +1672,7 @@ __device__ __forceinline__ void execute_worker_multi_group_aligned(
 #endif
 
 #ifdef MPK_ENABLE_PROFILING
-    if (lane == 0) {
+    if (lane == 0 && do_profile) {
       local_task_counter = atomicAdd(&task_counter, 1u);
       PROFILER_EVENT_START(task_desc->task_type, local_task_counter);
     }
@@ -1702,13 +1703,13 @@ __device__ __forceinline__ void execute_worker_multi_group_aligned(
     wg_sync<WORKER_NUM_THREADS>(3);
 
 #ifdef MPK_ENABLE_PROFILING
-    if (lane == 0) {
+    if (lane == 0 && do_profile) {
       PROFILER_EVENT_END(task_desc->task_type, local_task_counter);
     }
 #endif
 
 #ifdef MPK_ENABLE_PROFILING
-    if (lane == 0) {
+    if (lane == 0 && do_profile) {
       local_task_counter = atomicAdd(&task_counter, 1u);
       PROFILER_EVENT_START(TASK_SCHD_EVENTS, local_task_counter);
     }
@@ -1724,7 +1725,9 @@ __device__ __forceinline__ void execute_worker_multi_group_aligned(
              (int)task_desc->task_type);
 #endif
 #ifdef MPK_ENABLE_PROFILING
-      PROFILER_EVENT_END(TASK_SCHD_EVENTS, local_task_counter);
+      if (do_profile) {
+        PROFILER_EVENT_END(TASK_SCHD_EVENTS, local_task_counter);
+      }
 #endif
       atomicExch(&slot_state[group_id], 0);
     }
@@ -2248,26 +2251,6 @@ __device__ __forceinline__ void execute_scheduler_balanced(RuntimeConfig config,
                        (unsigned long long)task_pos,
                        (unsigned long long)task_in_evt,
                        worker_id);
-                // if (sched_id == 0) {
-                //   printf("[%d][SCHD] EVENT_LAUNCH_DEPENDENT_TASKS schd_id(%d) "
-                //          "iter_num(%llu) task_pos(%llu) "
-                //          "worker_id(%d) "
-                //          "worker_last_ready_pos(%llu)"
-                //          "event_id(%llu)"
-                //          "total_event_range(%llu-%llu)"
-                //          "my_event_range(%llu-%llu)\n",
-                //          config.my_gpu_id,
-                //          sched_id,
-                //          (unsigned long long)iteration_num,
-                //          (unsigned long long)task_pos,
-                //          worker_id,
-                //          (unsigned long long)(last_task_id + 1),
-                //          (unsigned long long)event_id,
-                //          (unsigned long long)e.first_task_id,
-                //          (unsigned long long)e.last_task_id,
-                //          (unsigned long long)my_first_task,
-                //          (unsigned long long)my_last_task);
-                // }
                 }
               }
 #endif
