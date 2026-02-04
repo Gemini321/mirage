@@ -147,6 +147,9 @@ __device__ __forceinline__ void linear_kernel(void const *input_ptr,
       ((SMEM_PER_GROUP_RAW + 15) / 16) * 16; // keep 16B alignment
   char *smem_g = smem + static_cast<size_t>(group_id) * SMEM_PER_GROUP;
 
+  static_assert(2 * SMEM_PER_GROUP <= mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE,
+                "Not enough shared memory per worker group for linear kernel");
+
   // zero buffer
   T *zero_buf = (T *)(smem_g + ZERO_BUFFER_OFFSET);
   vec_zero_t<T, 8>::fill_zero(zero_buf);

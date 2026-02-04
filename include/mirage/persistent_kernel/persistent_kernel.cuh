@@ -313,17 +313,37 @@ __device__ __forceinline__ char *__mirage_task_enter_smem_only(
     uint32_t req_smem,
     char *smem_base,
     uint32_t smem_capacity) {
-  (void)ctx;
-
-  // uint32_t off = ctx->group_smem_offset[group_id];
-  uint32_t off = group_id * (smem_capacity / 2 / 1024) * 1024;
-  return (req_smem == 0) ? smem_base : (smem_base + off);
+  uint32_t off = 0;
+  int handle = -1;
+  if (threadIdx.x % WORKER_NUM_THREADS == 0) {
+    while (!__mirage_try_alloc_smem(ctx->smem_blocks,
+                                    &ctx->smem_lock,
+                                    smem_capacity,
+                                    req_smem,
+                                    group_id,
+                                    &off,
+                                    &handle)) {
+      __nanosleep(20);
+    }
+    ctx->group_smem_offset[group_id] = off;
+    ctx->group_smem_handle[group_id] = handle;
+  }
+  wg_sync<WORKER_NUM_THREADS>(3);
+  // return (req_smem == 0) ? smem_base : (smem_base + off);
+  return smem_base;
 }
 
 __device__ __forceinline__ void __mirage_task_exit_smem_only(
     __mirage_exec_ctx *ctx, int group_id) {
-  (void)ctx;
-  (void)group_id;
+  wg_sync<WORKER_NUM_THREADS>(3);
+  if (threadIdx.x % WORKER_NUM_THREADS == 0) {
+    int const handle = ctx->group_smem_handle[group_id];
+    if (handle != -1) {
+      __mirage_free_smem(ctx->smem_blocks, &ctx->smem_lock, handle, group_id);
+      ctx->group_smem_handle[group_id] = -1;
+      ctx->group_smem_offset[group_id] = 0;
+    }
+  }
 }
 
 __device__ __forceinline__ bool
@@ -1412,8 +1432,8 @@ __device__ __forceinline__ void execute_worker_multi_group_aligned(
   if (threadIdx.x == 0) {
     worker_queue = config.worker_queues[worker_id];
     worker_queue_id = worker_id;
-    next_task_pos[0] = 1;
-    next_task_pos[1] = 0;
+    next_task_pos[0] = 0;
+    next_task_pos[1] = 1;
     last_task_pos = 0;
     terminate_all = 0;
     task_exec_lock = 0;
@@ -1486,7 +1506,7 @@ __device__ __forceinline__ void execute_worker_multi_group_aligned(
                 &worker_queue[cur % config.per_worker_queue_len]);
 #ifdef MPK_ENABLE_PROFILING
             unsigned long long const tid_iter = get_task_iteration_num(tid);
-            if (tid_iter == 10ull) {
+            if (tid_iter == 110ull) {
               fetch_task_ev_no[group_id] = atomicAdd(&task_counter, 1u);
               fetch_task_ev_active[group_id] = 1;
               PROFILER_EVENT_START(TASK_GET_NEXT_TASK,
@@ -1570,15 +1590,14 @@ __device__ __forceinline__ void execute_worker_multi_group_aligned(
 #ifdef MPK_ENABLE_PROFILING
     int do_profile = 0;
     if (lane == 0) {
-      if (task_iter == 10ull) {
+      if (task_iter == 110ull) {
         do_profile = 1;
       }
     }
 #endif
 
 #if MIRAGE_WORKER_LOG
-    if (blockIdx.x == 40 && lane == 0 &&
-        task_desc->task_type == TASK_LINEAR_WITH_RESIDUAL) {
+    if (blockIdx.x == 0 && lane == 0) {
       unsigned long long const task_pos =
           (unsigned long long)get_task_position_index(task_id);
       printf("[WORKER][EXEC] worker=%d group=%d task_pos=%llu task_type=%d variant=%u\n",
@@ -1678,27 +1697,9 @@ __device__ __forceinline__ void execute_worker_multi_group_aligned(
     }
 #endif
 
-    // Serialize task execution across groups. This keeps Ampere tasks that use
-    // the full CTA dynamic shared memory (e.g., paged attention) correct when
-    // the worker CTA is launched with 2 groups.
-    if (lane == 0) {
-      while (atomicCAS(&task_exec_lock, 0, 1) != 0) {
-        if (atomicAdd(&terminate_all, 0) != 0) {
-          break;
-        }
-        __nanosleep(20);
-      }
-    }
-    wg_sync<WORKER_NUM_THREADS>(3);
-
     if (task_desc->task_type != TASK_BEGIN_TASK_GRAPH) {
       __mirage_execute_task_noinline(
           task_desc, config, &exec_ctx, group_id, smem_base, smem_capacity);
-    }
-    wg_sync<WORKER_NUM_THREADS>(3);
-
-    if (lane == 0) {
-      atomicExch(&task_exec_lock, 0);
     }
     wg_sync<WORKER_NUM_THREADS>(3);
 
@@ -2183,13 +2184,27 @@ __device__ __forceinline__ void execute_scheduler_balanced(RuntimeConfig config,
               continue;
             }
             unsigned long long const total_tasks = kernel_end - kernel_begin;
-            unsigned long long const sched_chunk =
-                (total_tasks + static_cast<unsigned long long>(sched_count) - 1) /
-                static_cast<unsigned long long>(sched_count);
+            unsigned long long const k = 2ull;
+            unsigned long long const total_blocks = total_tasks / k;
+            unsigned long long const rem_tasks = total_tasks - total_blocks * k;
+            unsigned long long const blocks_base =
+                total_blocks / static_cast<unsigned long long>(sched_count);
+            unsigned long long const blocks_rem =
+                total_blocks % static_cast<unsigned long long>(sched_count);
+            unsigned long long const sched_blocks =
+                blocks_base +
+                (static_cast<unsigned long long>(sched_index) < blocks_rem ? 1ull : 0ull);
+            unsigned long long const blocks_before =
+                blocks_base * static_cast<unsigned long long>(sched_index) +
+                min(static_cast<unsigned long long>(sched_index), blocks_rem);
+            unsigned long long const extra_before =
+                min(static_cast<unsigned long long>(sched_index), rem_tasks);
+            unsigned long long const sched_extra =
+                (static_cast<unsigned long long>(sched_index) < rem_tasks) ? 1ull : 0ull;
             unsigned long long const sched_begin =
-                kernel_begin + sched_chunk * static_cast<unsigned long long>(sched_index);
+                kernel_begin + blocks_before * k + extra_before;
             unsigned long long const sched_end =
-                min(kernel_end, sched_begin + sched_chunk);
+                min(kernel_end, sched_begin + sched_blocks * k + sched_extra);
             if (sched_begin >= sched_end) {
               kernel_pos = kernel_end;
               continue;
@@ -2234,7 +2249,7 @@ __device__ __forceinline__ void execute_scheduler_balanced(RuntimeConfig config,
 #if MIRAGE_SCHED_LOG
               {
                 TaskDesc const &desc = config.all_tasks[task_pos];
-                if (desc.task_type == TASK_LINEAR_WITH_RESIDUAL && sched_id == 0) {
+                if (desc.task_type == TASK_LINEAR_WITH_RESIDUAL) {
                 TaskId const task_id =
                     compute_task_id(iteration_num, task_pos);
                 unsigned long long const task_in_evt =
@@ -2322,13 +2337,27 @@ __device__ __forceinline__ void execute_scheduler_balanced(RuntimeConfig config,
               continue;
             }
             unsigned long long const total_tasks = kernel_end - kernel_begin;
-            unsigned long long const sched_chunk =
-                (total_tasks + static_cast<unsigned long long>(sched_count) - 1) /
-                static_cast<unsigned long long>(sched_count);
+            unsigned long long const k = 2ull;
+            unsigned long long const total_blocks = total_tasks / k;
+            unsigned long long const rem_tasks = total_tasks - total_blocks * k;
+            unsigned long long const blocks_base =
+                total_blocks / static_cast<unsigned long long>(sched_count);
+            unsigned long long const blocks_rem =
+                total_blocks % static_cast<unsigned long long>(sched_count);
+            unsigned long long const sched_blocks =
+                blocks_base +
+                (static_cast<unsigned long long>(sched_index) < blocks_rem ? 1ull : 0ull);
+            unsigned long long const blocks_before =
+                blocks_base * static_cast<unsigned long long>(sched_index) +
+                min(static_cast<unsigned long long>(sched_index), blocks_rem);
+            unsigned long long const extra_before =
+                min(static_cast<unsigned long long>(sched_index), rem_tasks);
+            unsigned long long const sched_extra =
+                (static_cast<unsigned long long>(sched_index) < rem_tasks) ? 1ull : 0ull;
             unsigned long long const sched_begin =
-                kernel_begin + sched_chunk * static_cast<unsigned long long>(sched_index);
+                kernel_begin + blocks_before * k + extra_before;
             unsigned long long const sched_end =
-                min(kernel_end, sched_begin + sched_chunk);
+                min(kernel_end, sched_begin + sched_blocks * k + sched_extra);
             if (sched_begin >= sched_end) {
               kernel_pos = kernel_end;
               continue;

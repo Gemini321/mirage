@@ -933,6 +933,7 @@ __device__ __forceinline__ void multitoken_paged_attention_task_impl_32_64_block
        token_offset += MAX_TOKENS) {
     int const num_tokens =
         min(MAX_TOKENS, total_num_tokens - token_offset);
+    int const token_base = seq_len - total_num_tokens + token_offset;
 
     T const *__restrict__ d_q =
         reinterpret_cast<T const *>(qkv_ptr) +
@@ -972,7 +973,7 @@ __device__ __forceinline__ void multitoken_paged_attention_task_impl_32_64_block
          chunk_idx += NUM_THREADS) {
       int dst_row = chunk_idx / HEAD_DIM_COPY_ITER;
       int col = (chunk_idx % HEAD_DIM_COPY_ITER) * CP_CHUNK_SIZE;
-      if (dst_row + cp_finished_seq_len < seq_len - total_num_tokens) {
+      if (dst_row + cp_finished_seq_len < token_base) {
         // load from KV Cache
         int page_offset = (dst_row + cp_finished_seq_len) % PAGE_SIZE;
         int src_row = page_idx_0 * PAGE_SIZE + page_offset;
@@ -980,7 +981,7 @@ __device__ __forceinline__ void multitoken_paged_attention_task_impl_32_64_block
         load_smem(v_buffer_smem(dst_row, col), paged_v_cache_dmem(src_row, col));
       } else {
         // load from QKV
-        int src_row = dst_row + cp_finished_seq_len - (seq_len - total_num_tokens);
+        int src_row = dst_row + cp_finished_seq_len - token_base;
         load_smem(k_buffer_smem(dst_row, col), k_dmem(src_row, col));
         load_smem(v_buffer_smem(dst_row, col), v_dmem(src_row, col));
       }
@@ -1021,7 +1022,7 @@ __device__ __forceinline__ void multitoken_paged_attention_task_impl_32_64_block
            chunk_idx += NUM_THREADS) {
         int dst_row = chunk_idx / HEAD_DIM_COPY_ITER;
         int col = (chunk_idx % HEAD_DIM_COPY_ITER) * CP_CHUNK_SIZE;
-      if (dst_row + cp_finished_seq_len < seq_len - total_num_tokens) {
+      if (dst_row + cp_finished_seq_len < token_base) {
           // load from KV Cache
           // int page_idx =
           //    page_indices[(dst_row + cp_finished_seq_len) / PAGE_SIZE];
@@ -1031,7 +1032,7 @@ __device__ __forceinline__ void multitoken_paged_attention_task_impl_32_64_block
           load_smem(v_smem(dst_row, col), (paged_v_cache_dmem(src_row, col)));
         } else {
           // load from QKV
-        int src_row = dst_row + cp_finished_seq_len - (seq_len - total_num_tokens);
+        int src_row = dst_row + cp_finished_seq_len - token_base;
           load_smem(k_smem(dst_row, col), (k_dmem(src_row, col)));
           load_smem(v_smem(dst_row, col), (v_dmem(src_row, col)));
         }
@@ -1059,7 +1060,7 @@ __device__ __forceinline__ void multitoken_paged_attention_task_impl_32_64_block
 
     int kv_tokens_to_process = min(
         curr_iter_len,
-        max(iter * KV_TILE_SIZE + curr_iter_len - (seq_len - total_num_tokens), 0));
+        max(iter * KV_TILE_SIZE + curr_iter_len - token_base, 0));
     int first_kv_token_to_process =
         iter * KV_TILE_SIZE + curr_iter_len - kv_tokens_to_process;
     if (qk_norm) {

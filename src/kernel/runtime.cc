@@ -1469,7 +1469,7 @@ TaskGraphResult print_task_graph(
             task_type_to_name[task.first],
             variant_id);
       }
-      code.e("#if defined(MIRAGE_GRACE_HOPPER)");
+      // code.e("#if defined(MIRAGE_GRACE_HOPPER)");
       // Hardcode per-task/variant resource usage (regs + dynamic smem) so ptxas
       // sees a predictable target at each branch and the runtime can drive
       // setmaxnreg deterministically without relying on a shared switch.
@@ -1477,7 +1477,7 @@ TaskGraphResult print_task_graph(
       // NOTE: These numbers are derived from entry regprobe reports and use
       // conservative rounding (regs -> next multiple of 8).
       int reg_target = 224;
-      int smem_dynamic = 0;
+      int smem_dynamic = 120000;
       bool smem_dynamic_is_capacity = true;
       if (task.first == TASK_PAGED_ATTENTION_HOPPER && variant_id == 0) {
         reg_target = 192;        // regs=188 -> ceil8
@@ -1490,6 +1490,16 @@ TaskGraphResult print_task_graph(
       } else if (task.first == TASK_ARGMAX_REDUCE && variant_id == 0) {
         reg_target = 96;         // regs=32
         smem_dynamic = 10000;
+        smem_dynamic_is_capacity = false;
+      } else if (task.first == TASK_LINEAR_WITH_RESIDUAL &&
+                 (variant_id == 0 || variant_id == 1)) {
+        reg_target = 96;         // regs=32
+        smem_dynamic = 60000;
+        smem_dynamic_is_capacity = false;
+      } else if (task.first == TASK_LINEAR &&
+                 (variant_id == 0 || variant_id == 1 || variant_id == 2)) {
+        reg_target = 128;         // regs=30/31 -> ceil8
+        smem_dynamic = 60000;
         smem_dynamic_is_capacity = false;
       } else if (task.first == TASK_LINEAR_SWAPAB_WITH_RESIDUAL_HOPPER &&
                  (variant_id == 0 || variant_id == 1)) {
@@ -1515,11 +1525,12 @@ TaskGraphResult print_task_graph(
         smem_dynamic_is_capacity = false;
       }
       code.e("uint32_t __mirage_reg_target = $;", reg_target);
-      if (smem_dynamic_is_capacity) {
-        code.e("uint32_t __mirage_smem_dynamic = smem_capacity;");
-      } else {
-        code.e("uint32_t __mirage_smem_dynamic = $;", smem_dynamic);
-      }
+      code.e("uint32_t __mirage_smem_dynamic = $;", smem_dynamic);
+      // if (smem_dynamic_is_capacity) {
+      //   code.e("uint32_t __mirage_smem_dynamic = smem_capacity;");
+      // } else {
+      //   code.e("uint32_t __mirage_smem_dynamic = $;", smem_dynamic);
+      // }
       // code.e("char* task_smem_ptr = __mirage_task_enter(reinterpret_cast<__mirage_exec_ctx*>(exec_ctx),");
       // code.e("                                  group_id,");
       // code.e("                                  __mirage_reg_target,");
@@ -1531,16 +1542,16 @@ TaskGraphResult print_task_graph(
       code.e("                                  __mirage_smem_dynamic,");
       code.e("                                  smem_base,");
       code.e("                                  smem_capacity);");
-      code.e("#else");
-      code.e("char* task_smem_ptr = smem_base;");
-      code.e("#endif");
+      // code.e("#else");
+      // code.e("char* task_smem_ptr = smem_base;");
+      // code.e("#endif");
       code.e("// MIRAGE_TASK_BODY_BEGIN");
       code.e("$", task.second[variant_id]);
       code.e("// MIRAGE_TASK_BODY_END");
-      code.e("#if defined(MIRAGE_GRACE_HOPPER)");
+      // code.e("#if defined(MIRAGE_GRACE_HOPPER)");
       // code.e("__mirage_task_exit(reinterpret_cast<__mirage_exec_ctx*>(exec_ctx), group_id, __mirage_reg_target);");
       code.e("__mirage_task_exit_smem_only(reinterpret_cast<__mirage_exec_ctx*>(exec_ctx), group_id);");
-      code.e("#endif");
+      // code.e("#endif");
       code.e("return;");
       code.e("}");
 	    }

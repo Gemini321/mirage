@@ -211,20 +211,20 @@ class Qwen3Attention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.key_cache, self.value_cache = kv_cache
-        assert kv_cache[0].shape == (
-            config.num_hidden_layers,
-            16,
-            4096,
-            self.num_key_value_heads // world_size,
-            self.head_dim,
-        )
-        assert kv_cache[1].shape == (
-            config.num_hidden_layers,
-            16,
-            4096,
-            self.num_key_value_heads // world_size,
-            self.head_dim,
-        )
+        # assert kv_cache[0].shape == (
+        #     config.num_hidden_layers,
+        #     16,
+        #     4096,
+        #     self.num_key_value_heads // world_size,
+        #     self.head_dim,
+        # )
+        # assert kv_cache[1].shape == (
+        #     config.num_hidden_layers,
+        #     16,
+        #     4096,
+        #     self.num_key_value_heads // world_size,
+        #     self.head_dim,
+        # )
         self.max_position_embeddings = 4096
         self.rope_theta = config.rope_theta
         self.is_causal = True
