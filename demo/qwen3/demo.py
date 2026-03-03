@@ -357,7 +357,7 @@ if __name__ == "__main__":
 
         if args.profiling:
             profiler_tensor = torch.zeros(
-                3000 * 128, dtype=torch.uint64, device="cuda"
+                4000 * 128, dtype=torch.uint64, device="cuda"
             ).contiguous()
         else:
             profiler_tensor = None
@@ -679,7 +679,8 @@ if __name__ == "__main__":
                 weight=w,
                 residual=x,
                 output=attn_proj_out,
-                grid_dim=(hidden_size // 64, split_batch_size, 1),
+                # grid_dim=(hidden_size // 64, split_batch_size, 1),
+                grid_dim=(split_batch_size, hidden_size // 64, 1),
                 block_dim=(128, 1, 1),
             )
             # reset residual input as x
@@ -749,7 +750,8 @@ if __name__ == "__main__":
                 weight=w,
                 residual=x,
                 output=mlp_out,
-                grid_dim=(hidden_size // 64, split_batch_size, 1),
+                # grid_dim=(hidden_size // 64, split_batch_size, 1),
+                grid_dim=(split_batch_size, hidden_size // 64, 1),
                 block_dim=(128, 1, 1),
             )
             # reset residual input as x
@@ -838,7 +840,7 @@ if __name__ == "__main__":
             input=rmsnorm_out,
             weight=w_proj,
             output=argmax_in,
-            grid_dim=(mpk.num_workers, split_batch_size, 1),
+            grid_dim=(w_proj.dim(0) // 256, split_batch_size, 1),
             block_dim=(128, 1, 1),
         )
         #mpk.rmsnorm_linear_layer(

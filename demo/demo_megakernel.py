@@ -235,12 +235,12 @@ def main():
     parser.add_argument("--warmup-iters", type=int, default=10)
     parser.add_argument("--bench-iters", type=int, default=100)
     parser.add_argument(
-        "--profile",
+        "--profiling",
         action="store_true",
         help="Export a single Perfetto trace for one mpk() call.",
     )
     parser.add_argument(
-        "--profile-name",
+        "--profiling-name",
         type=str,
         default="profile",
         help="Trace name used when exporting a Perfetto profile (requires --profile).",
@@ -285,17 +285,17 @@ def main():
         ),
         help="Which kernel or Qwen3 graph to build.",
     )
-    parser.add_argument("--num-workers", type=int, default=104)
-    parser.add_argument("--num-schedulers", type=int, default=16)
+    parser.add_argument("--num-workers", type=int, default=96)
+    parser.add_argument("--num-schedulers", type=int, default=48)
 
     # Linear options.
     # Match the default (token, hidden) layout used by `demo/qwen3/demo_hopper.py`:
     # input:  [max_num_batched_tokens, hidden_size]  (default: 8 x 5120)
     # weight: [out_features, hidden_size]            (default: 10240 x 5120, i.e. fused QKV proj, 64 q_head and 8 kv_head)
     # output: [max_num_batched_tokens, out_features]
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--in-features", type=int, default=5120)
-    parser.add_argument("--out-features", type=int, default=10240)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--in-features", type=int, default=4096)
+    parser.add_argument("--out-features", type=int, default=153600)
     parser.add_argument(
         "--has-residual",
         action=argparse.BooleanOptionalAction,
@@ -445,7 +445,7 @@ def main():
 
     print(f'num_workers: {num_workers}, num_schedulers: {num_schedulers}')
     profiler_tensor = None
-    if args.profile:
+    if args.profiling:
         # Hopper worker kernel uses 2 warp-groups per CTA (blockDim=2*WORKER_NUM_THREADS).
         num_groups = 2 if cc == 90 else 1
         stride = num_workers * num_groups
@@ -472,7 +472,7 @@ def main():
         eos_token_id=0 if args.kernel in ("paged_attention", "qwen3_full") else -1,
         meta_tensors=meta_tensors,
         profiler_tensor=profiler_tensor,
-        trace_name=args.profile_name if args.profile else "",
+        trace_name=args.profiling_name if args.profiling else "",
         spec_decode_config=None,
         use_cutlass_kernel=False,
     )
@@ -545,12 +545,14 @@ def main():
         y = mpk.attach_input(y_t, name="y")
         residual = mpk.attach_input(residual_t, name="residual") if residual_t is not None else None
 
-        grid_x = grid_for_rmsnorm_linear_layer(args.out_features)
+        # grid_x = grid_for_rmsnorm_linear_layer(args.out_features)
+        grid_x = args.out_features // 256
+        split_batch_size = max(args.batch_size // 16, 1)
         if args.out_features % grid_x != 0:
             raise SystemExit(
                 f"linear grid mismatch: out_features={args.out_features} not divisible by grid_x={grid_x}"
             )
-        print(f"[linear] grid_dim=({grid_x}, 1, 1) tasks={grid_x} out_per_task={args.out_features // grid_x}")
+        print(f"[linear] grid_dim=({split_batch_size}, {grid_x}, 1) tasks={split_batch_size * grid_x} out_per_task={args.out_features // grid_x}")
 
         block_x = 256 if cc >= 90 else 128
         if args.kernel == "linear_with_residual" or args.has_residual:
@@ -559,7 +561,7 @@ def main():
                 weight=w,
                 residual=residual,
                 output=y,
-                grid_dim=(grid_x, 1, 1),
+                grid_dim=(split_batch_size, grid_x, 1),
                 block_dim=(block_x, 1, 1),
             )
         else:
@@ -567,7 +569,7 @@ def main():
                 input=x,
                 weight=w,
                 output=y,
-                grid_dim=(grid_x, 1, 1),
+                grid_dim=(grid_x, split_batch_size, 1),
                 block_dim=(block_x, 1, 1),
             )
     elif args.kernel == "rmsnorm":
@@ -663,229 +665,6 @@ def main():
             grid_dim=(1, 1, 1),
             block_dim=(128 if cc < 90 else 256, 1, 1),
         )
-    elif args.kernel == "qwen3_full":
-        if args.qwen3_layers != 1:
-            raise SystemExit("--qwen3-layers currently supports only 1 in qwen3_full demo")
-        if args.hidden_size != args.num_q_heads * args.head_dim:
-            raise SystemExit("--hidden-size must equal --num-q-heads * --head-dim for qwen3_full")
-        if args.hidden_size % 64 != 0:
-            raise SystemExit("--hidden-size must be divisible by 64 for qwen3_full")
-        if args.intermediate_size % 64 != 0:
-            raise SystemExit("--intermediate-size must be divisible by 64 for qwen3_full")
-        if args.vocab_size % args.argmax_tasks != 0:
-            raise SystemExit("--vocab-size must be divisible by --argmax-tasks for qwen3_full")
-
-        num_tokens = args.max_tokens
-        num_qo_per_kv = args.num_q_heads // args.num_kv_heads
-        fused_outdim_1 = (args.num_q_heads + 2 * args.num_kv_heads) * args.head_dim
-
-        input_tokens_t = torch.randint(
-            low=0,
-            high=args.vocab_size,
-            size=(num_tokens, 1),
-            device="cuda",
-            dtype=torch.int64,
-        )
-        meta_tensors["input_tokens"].copy_(input_tokens_t)
-        _set_num_active_tokens(meta_tensors, max_num_batched_requests, num_tokens)
-        meta_tensors["prompt_lengths"][0] = num_tokens
-
-        embed_w_t = torch.randn((args.vocab_size, args.hidden_size), device="cuda", dtype=torch.bfloat16)
-        w_q_t = torch.randn(
-            (args.num_kv_heads, num_qo_per_kv, args.head_dim, args.hidden_size),
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
-        w_k_t = torch.randn(
-            (args.num_kv_heads, args.head_dim, args.hidden_size), device="cuda", dtype=torch.bfloat16
-        )
-        w_v_t = torch.randn(
-            (args.num_kv_heads, args.head_dim, args.hidden_size), device="cuda", dtype=torch.bfloat16
-        )
-        w_q_blocks = w_q_t.reshape(args.num_kv_heads, num_qo_per_kv * args.head_dim, args.hidden_size)
-        w_k_blocks = w_k_t.reshape(args.num_kv_heads, args.head_dim, args.hidden_size)
-        w_v_blocks = w_v_t.reshape(args.num_kv_heads, args.head_dim, args.hidden_size)
-        w_qkv_t = torch.cat([w_q_blocks, w_k_blocks, w_v_blocks], dim=1).reshape(
-            fused_outdim_1, args.hidden_size
-        )
-        w_o_t = torch.randn((args.hidden_size, args.hidden_size), device="cuda", dtype=torch.bfloat16)
-        w_gate_t = torch.randn((args.intermediate_size, args.hidden_size), device="cuda", dtype=torch.bfloat16)
-        w_up_t = torch.randn((args.intermediate_size, args.hidden_size), device="cuda", dtype=torch.bfloat16)
-        w_gatedup_t = torch.cat([w_gate_t, w_up_t], dim=0)
-        w_down_t = torch.randn((args.hidden_size, args.intermediate_size), device="cuda", dtype=torch.bfloat16)
-        w_lm_t = torch.randn((args.vocab_size, args.hidden_size), device="cuda", dtype=torch.bfloat16)
-
-        norm_1 = torch.randn((args.hidden_size,), device="cuda", dtype=torch.bfloat16)
-        norm_2 = torch.randn((args.hidden_size,), device="cuda", dtype=torch.bfloat16)
-        norm_3 = torch.randn((args.hidden_size,), device="cuda", dtype=torch.bfloat16)
-        q_norm_t = torch.ones((args.head_dim,), device="cuda", dtype=torch.bfloat16)
-        k_norm_t = torch.ones((args.head_dim,), device="cuda", dtype=torch.bfloat16)
-
-        if args.rope:
-            cos_t, sin_t = _make_rope_tables(max_seq_length, args.head_dim, "cuda")
-        else:
-            cos_t = torch.zeros((max_seq_length, args.head_dim), device="cuda", dtype=torch.bfloat16)
-            sin_t = torch.zeros_like(cos_t)
-
-        k_cache_t = torch.zeros(
-            (max_num_pages, page_size, args.num_kv_heads, args.head_dim),
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
-        v_cache_t = torch.zeros_like(k_cache_t)
-
-        embed_out_t = torch.empty((num_tokens, args.hidden_size), device="cuda", dtype=torch.bfloat16)
-        rms_1_out_t = torch.empty_like(embed_out_t)
-        attn_in_t = torch.empty((num_tokens, fused_outdim_1), device="cuda", dtype=torch.bfloat16)
-        attn_out_t = torch.empty((num_tokens, args.hidden_size), device="cuda", dtype=torch.bfloat16)
-        attn_proj_out_t = torch.empty_like(embed_out_t)
-        attn_allreduce_out_t = torch.empty_like(embed_out_t)
-        rms_2_out_t = torch.empty_like(embed_out_t)
-        mlp_mid_t = torch.empty((num_tokens, args.intermediate_size * 2), device="cuda", dtype=torch.bfloat16)
-        silu_out_t = torch.empty((num_tokens, args.intermediate_size), device="cuda", dtype=torch.bfloat16)
-        mlp_out_t = torch.empty_like(embed_out_t)
-        mlp_final_t = torch.empty_like(embed_out_t)
-        rms_3_out_t = torch.empty_like(embed_out_t)
-        logits_t = torch.empty((num_tokens, args.vocab_size), device="cuda", dtype=torch.bfloat16)
-        argmax_part_val_t = torch.empty((num_tokens, args.argmax_tasks), device="cuda", dtype=torch.bfloat16)
-        argmax_part_idx_t = torch.empty((num_tokens, args.argmax_tasks), device="cuda", dtype=torch.int64)
-        output_tokens_t = meta_tensors["output_tokens"]
-
-        input_tokens = mpk.attach_input(meta_tensors["input_tokens"], name="input_tokens")
-        embed_w = mpk.attach_input(embed_w_t, name="embed_w")
-        w_qkv = mpk.attach_input(w_qkv_t, name="w_qkv")
-        w_o = mpk.attach_input(w_o_t, name="w_o")
-        w_gatedup = mpk.attach_input(w_gatedup_t, name="w_gatedup")
-        w_down = mpk.attach_input(w_down_t, name="w_down")
-        w_lm = mpk.attach_input(w_lm_t, name="w_lm")
-        norm_w1 = mpk.attach_input(norm_1, name="norm_1")
-        norm_w2 = mpk.attach_input(norm_2, name="norm_2")
-        norm_w3 = mpk.attach_input(norm_3, name="norm_3")
-        q_norm = mpk.attach_input(q_norm_t, name="q_norm")
-        k_norm = mpk.attach_input(k_norm_t, name="k_norm")
-        cos = mpk.attach_input(cos_t, name="cos")
-        sin = mpk.attach_input(sin_t, name="sin")
-        k_cache = mpk.attach_input(k_cache_t, name="k_cache")
-        v_cache = mpk.attach_input(v_cache_t, name="v_cache")
-
-        embed_out = mpk.attach_input(embed_out_t, name="embed_out")
-        rms_1_out = mpk.attach_input(rms_1_out_t, name="rms_1_out")
-        attn_in = mpk.attach_input(attn_in_t, name="attn_in")
-        attn_out = mpk.attach_input(attn_out_t, name="attn_out")
-        attn_proj_out = mpk.attach_input(attn_proj_out_t, name="attn_proj_out")
-        attn_allreduce_out = mpk.attach_input(attn_allreduce_out_t, name="attn_allreduce_out")
-        rms_2_out = mpk.attach_input(rms_2_out_t, name="rms_2_out")
-        mlp_mid = mpk.attach_input(mlp_mid_t, name="mlp_mid")
-        silu_out = mpk.attach_input(silu_out_t, name="silu_out")
-        mlp_out = mpk.attach_input(mlp_out_t, name="mlp_out")
-        mlp_final = mpk.attach_input(mlp_final_t, name="mlp_final")
-        rms_3_out = mpk.attach_input(rms_3_out_t, name="rms_3_out")
-        logits = mpk.attach_input(logits_t, name="logits")
-        argmax_part_val = mpk.attach_input(argmax_part_val_t, name="argmax_part_val")
-        argmax_part_idx = mpk.attach_input(argmax_part_idx_t, name="argmax_part_idx")
-        output_tokens = mpk.attach_input(output_tokens_t, name="output_tokens")
-
-        mpk.embed_layer(
-            input=input_tokens,
-            weight=embed_w,
-            output=embed_out,
-            grid_dim=(1, 1, 1),
-            block_dim=(128 if cc < 90 else 256, 1, 1),
-            input_source=1,
-        )
-        mpk.rmsnorm_layer(
-            input=embed_out,
-            weight=norm_w1,
-            output=rms_1_out,
-            grid_dim=(num_tokens, 1, 1),
-            block_dim=(128 if cc < 90 else 256, 1, 1),
-        )
-        grid_qkv = grid_for_rmsnorm_linear_layer(w_qkv.dim(0))
-        mpk.linear_layer(
-            input=rms_1_out,
-            weight=w_qkv,
-            output=attn_in,
-            grid_dim=(grid_qkv, 1, 1),
-            block_dim=(128 if cc < 90 else 256, 1, 1),
-        )
-        mpk.paged_attention_layer(
-            input=attn_in,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            q_norm=q_norm if args.qk_norm else None,
-            k_norm=k_norm if args.qk_norm else None,
-            cos_pos_embed=cos if args.rope else None,
-            sin_pos_embed=sin if args.rope else None,
-            output=attn_out,
-            grid_dim=(1, args.num_kv_heads, 1),
-            block_dim=(128 if cc < 90 else 256, 1, 1),
-        )
-        mpk.linear_with_residual_layer(
-            input=attn_out,
-            weight=w_o,
-            residual=embed_out,
-            output=attn_proj_out,
-            grid_dim=(args.hidden_size // 64, 1, 1),
-            block_dim=(128 if cc < 90 else 256, 1, 1),
-        )
-        attn_allreduce_out = attn_proj_out
-        mpk.rmsnorm_layer(
-            input=attn_allreduce_out,
-            weight=norm_w2,
-            output=rms_2_out,
-            grid_dim=(num_tokens, 1, 1),
-            block_dim=(128 if cc < 90 else 256, 1, 1),
-        )
-        grid_gatedup = grid_for_rmsnorm_linear_layer(w_gatedup.dim(0))
-        mpk.linear_layer(
-            input=rms_2_out,
-            weight=w_gatedup,
-            output=mlp_mid,
-            grid_dim=(grid_gatedup, 1, 1),
-            block_dim=(128 if cc < 90 else 256, 1, 1),
-        )
-        mpk.silu_mul_layer(
-            input=mlp_mid,
-            output=silu_out,
-            grid_dim=(1, 1, 1),
-            block_dim=(128 if cc < 90 else 256, 1, 1),
-        )
-        mpk.linear_with_residual_layer(
-            input=silu_out,
-            weight=w_down,
-            residual=attn_allreduce_out,
-            output=mlp_out,
-            grid_dim=(args.hidden_size // 64, 1, 1),
-            block_dim=(128 if cc < 90 else 256, 1, 1),
-        )
-        mlp_final = mlp_out
-        mpk.rmsnorm_layer(
-            input=mlp_final,
-            weight=norm_w3,
-            output=rms_3_out,
-            grid_dim=(num_tokens, 1, 1),
-            block_dim=(128 if cc < 90 else 256, 1, 1),
-        )
-        grid_lm = grid_for_rmsnorm_linear_layer(w_lm.dim(0))
-        mpk.linear_layer(
-            input=rms_3_out,
-            weight=w_lm,
-            output=logits,
-            grid_dim=(grid_lm, 1, 1),
-            block_dim=(128 if cc < 90 else 256, 1, 1),
-        )
-        mpk.argmax_partial_layer(
-            input=logits,
-            output=(argmax_part_val, argmax_part_idx),
-            grid_dim=(args.argmax_tasks, 1, 1),
-            block_dim=(128 if cc < 90 else 256, 1, 1),
-        )
-        mpk.argmax_reduce_layer(
-            input=(argmax_part_val, argmax_part_idx),
-            output=output_tokens,
-            grid_dim=(1, 1, 1),
-            block_dim=(128 if cc < 90 else 256, 1, 1),
-        )
 
     args.output_dir = args.output_dir if args.output_dir is not None else os.getcwd()
 
@@ -896,10 +675,10 @@ def main():
         noinline_task_wrappers=True,
     )
 
-    if args.profile:
+    if args.profiling:
         torch.cuda.synchronize()
         mpk()
-        print(f"[profile] exported trace name={args.profile_name!r}")
+        print(f"[profile] exported trace name={args.profiling_name!r}")
         # Disable exporting during warmup/bench loops (keeps kernel instrumentation).
         mpk.profiler_tensor = None
 
