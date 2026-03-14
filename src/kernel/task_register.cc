@@ -226,13 +226,16 @@ int TaskRegister::register_attention_task(threadblock::Graph const &bgraph,
 
 int TaskRegister::register_paged_attention_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  // params[0]: num_q_heads
-  // params[1]: num_kv_heads
+  // params[0]: total_num_q_heads
+  // params[1]: total_num_kv_heads
   // params[2]: qk_norm
   // params[3]: rotary_emd
   // params[4]: max_seq_len
   // params[5]: page_size
-  assert(params.size() == 6);
+  // params[6]: max_tokens (optional)
+  // params[7]: requests_per_task (optional, default 1)
+  // params[8]: kv_heads_per_task (optional, default 1)
+  assert(params.size() >= 6 && params.size() <= 9);
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
   int num_inputs = 7;
@@ -261,38 +264,80 @@ int TaskRegister::register_paged_attention_task(
   assert(head_dim == input_ops[1]->output_tensors[0].dim[3]);
   assert(input_ops[2]->output_tensors[0].num_dims == 4);
   assert(head_dim == input_ops[2]->output_tensors[0].dim[3]);
-  int max_tokens = input_ops[0]->dtensor.dim[0];
+  int max_tokens =
+      params.size() >= 7 ? params[6] : static_cast<int>(input_ops[0]->dtensor.dim[0]);
+  int requests_per_task = params.size() >= 8 ? params[7] : 1;
+  int kv_heads_per_task = params.size() >= 9 ? params[8] : 1;
+  assert(requests_per_task > 0);
+  assert(kv_heads_per_task > 0);
+  assert(num_kv_heads % kv_heads_per_task == 0);
+  int num_q_heads_per_task = (num_q_heads / num_kv_heads) * kv_heads_per_task;
+
+  // When using non-default autotune params (requests_per_task > 1 or
+  // kv_heads_per_task > 1), emit the for-loop version.
+  // Otherwise emit baseline-identical code (no loop, direct request_id)
+  // to avoid stack size regression.
+  bool use_loop = (requests_per_task > 1);
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::multitoken_paged_attention_task_impl<bfloat16, $, $, $, $, "
-         "$, $, $, $, $>(",
-         num_q_heads / num_kv_heads,
-         1,
-         kv_stride,
-         qkv_stride,
-         output_size,
-         head_dim,
-         max_seq_len,
-         page_size,
-         max_tokens);
-  code.e("    task_desc->input_ptrs[0],");
-  code.e("    task_desc->input_ptrs[1],");
-  code.e("    task_desc->input_ptrs[2],");
-  code.e("    task_desc->output_ptrs[0],");
-  code.e("    runtime_config.qo_indptr_buffer,");
-  code.e("    runtime_config.paged_kv_indptr_buffer,");
-  code.e("    runtime_config.paged_kv_indices_buffer,");
-  code.e("    runtime_config.paged_kv_last_page_len_buffer,");
-  code.e("    task_desc->task_metadata.request_id,");
-  code.e("    $,", params[2] > 0);
-  code.e("    $,", params[3] > 0);
-  code.e("    task_desc->input_ptrs[3],");
-  code.e("    task_desc->input_ptrs[4],");
-  code.e("    task_desc->input_ptrs[5],");
-  code.e("    task_desc->input_ptrs[6],");
-  code.e("    1e-6f,");
-  code.e("    1e-6f);");
+  if (use_loop) {
+    code.e("  int request_start = task_desc->task_metadata.request_id * $;",
+           requests_per_task);
+    code.e("  int request_end = request_start + $;", requests_per_task);
+    code.e("  if (request_end > MPK_MAX_NUM_BATCHED_REQUESTS) {");
+    code.e("    request_end = MPK_MAX_NUM_BATCHED_REQUESTS;");
+    code.e("  }");
+    code.e("  for (int request_id = request_start; request_id < request_end; ++request_id) {");
+    code.e("    kernel::multitoken_paged_attention_task_impl<bfloat16, $, $, $, $, "
+           "$, $, $, $, $>(",
+           num_q_heads_per_task,
+           kv_heads_per_task,
+           kv_stride,
+           qkv_stride,
+           output_size,
+           head_dim,
+           max_seq_len,
+           page_size,
+           max_tokens);
+  } else {
+    // Default: baseline-identical template args (num_q_heads/num_kv_heads, 1)
+    code.e("    kernel::multitoken_paged_attention_task_impl<bfloat16, $, $, $, $, "
+           "$, $, $, $, $>(",
+           num_q_heads_per_task,
+           kv_heads_per_task,
+           kv_stride,
+           qkv_stride,
+           output_size,
+           head_dim,
+           max_seq_len,
+           page_size,
+           max_tokens);
+  }
+  code.e("        task_desc->input_ptrs[0],");
+  code.e("        task_desc->input_ptrs[1],");
+  code.e("        task_desc->input_ptrs[2],");
+  code.e("        task_desc->output_ptrs[0],");
+  code.e("        runtime_config.qo_indptr_buffer,");
+  code.e("        runtime_config.paged_kv_indptr_buffer,");
+  code.e("        runtime_config.paged_kv_indices_buffer,");
+  code.e("        runtime_config.paged_kv_last_page_len_buffer,");
+  if (use_loop) {
+    code.e("        request_id,");
+  } else {
+    code.e("        task_desc->task_metadata.request_id,");
+  }
+  code.e("        $,", params[2] > 0);
+  code.e("        $,", params[3] > 0);
+  code.e("        task_desc->input_ptrs[3],");
+  code.e("        task_desc->input_ptrs[4],");
+  code.e("        task_desc->input_ptrs[5],");
+  code.e("        task_desc->input_ptrs[6],");
+  code.e("        1e-6f,");
+  code.e("        1e-6f);");
+  if (use_loop) {
+    code.e("  }");
+  }
   return register_task_variant(TASK_PAGED_ATTENTION_1, code.to_string());
 }
 
@@ -499,7 +544,8 @@ int TaskRegister::register_silu_mul_linear_with_residual_task(
 int TaskRegister::register_linear_task(threadblock::Graph const &bgraph,
                                        std::vector<int> const &params,
                                        bool with_residual) {
-  assert(params.size() == 0);
+  assert(params.size() == 1);
+  int pipe_stage = params[0];
   int batch_size = 0, output_size = 0, reduction_size = 0, output_stride = 0;
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
@@ -528,11 +574,12 @@ int TaskRegister::register_linear_task(threadblock::Graph const &bgraph,
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::linear_kernel<bfloat16, $, $, $, $>(",
+  code.e("kernel::linear_kernel<bfloat16, $, $, $, $, $>(",
          batch_size,
          output_size,
          reduction_size,
-         output_stride);
+         output_stride,
+         pipe_stage);
   code.e("    task_desc->input_ptrs[0],");
   code.e("    task_desc->input_ptrs[1],");
   if (with_residual) {
@@ -965,13 +1012,16 @@ int TaskRegister::register_linear_hopper_task(threadblock::Graph const &bgraph,
 }
 int TaskRegister::register_paged_attention_hopper_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  // params[0]: num_q_heads
-  // params[1]: num_kv_heads
+  // params[0]: total_num_q_heads
+  // params[1]: total_num_kv_heads
   // params[2]: qk_norm
   // params[3]: rotary_emd
   // params[4]: max_seq_len
   // params[5]: page_size
-  assert(params.size() == 6);
+  // params[6]: max_tokens (optional)
+  // params[7]: requests_per_task (optional, default 1)
+  // params[8]: kv_heads_per_task (optional, default 1)
+  assert(params.size() >= 6 && params.size() <= 9);
 
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
@@ -999,7 +1049,15 @@ int TaskRegister::register_paged_attention_hopper_task(
   int kv_stride = head_dim * num_kv_heads;
   int max_seq_len = params[4];
   int page_size = params[5];
-  int max_tokens = input_ops[0]->dtensor.dim[0];
+  int max_tokens =
+      params.size() >= 7 ? params[6] : static_cast<int>(input_ops[0]->dtensor.dim[0]);
+  int requests_per_task = params.size() >= 8 ? params[7] : 1;
+  int kv_heads_per_task = params.size() >= 9 ? params[8] : 1;
+  assert(requests_per_task > 0);
+  assert(kv_heads_per_task > 0);
+  assert(num_kv_heads % kv_heads_per_task == 0);
+  int num_q_heads_per_task = num_q_heads_per_kv * kv_heads_per_task;
+  int num_qo_groups = num_kv_heads / kv_heads_per_task;
 
   assert(input_ops[1]->output_tensors[0].num_dims == 4);
   assert(head_dim == input_ops[1]->output_tensors[0].dim[3]);
@@ -1121,42 +1179,50 @@ int TaskRegister::register_paged_attention_hopper_task(
   //        "tma_output(static_cast<CUtensorMap*>(task_desc->output_tma_desc_ptrs["
   //        "0][0]));");
 
-  code.e("kernel::multitoken_paged_attention_hopper_impl<bfloat16, $, $, $, $, "
+  code.e("  int request_start = task_desc->task_metadata.request_id * $;",
+         requests_per_task);
+  code.e("  int request_end = request_start + $;", requests_per_task);
+  code.e("  if (request_end > MPK_MAX_NUM_BATCHED_REQUESTS) {");
+  code.e("    request_end = MPK_MAX_NUM_BATCHED_REQUESTS;");
+  code.e("  }");
+  code.e("  for (int request_id = request_start; request_id < request_end; ++request_id) {");
+  code.e("    kernel::multitoken_paged_attention_hopper_impl<bfloat16, $, $, $, $, "
          "$, $, $, $, $, "
          "$, $, $, $>(",
-         num_q_heads_per_kv, /* NUM_QO_HEADS               */
-         1,                  /* NUM_KV_HEADS               */
-         num_kv_heads,       /* NUM_QO_GROUPS              */
-         kv_stride,          /* KV_CACHE_STRIDE            */
-         qkv_stride,         /* QKV_STRIDE                 */
-         output_size,        /* O_STRIDE (= num_q_heads*head_dim) */
-         head_dim,           /* HEAD_DIM                   */
-         -1,          /* SEQ_LEN (not used for non-split KV tasks)          */
-         max_seq_len, /* MAX_SEQ_LEN                */
-         page_size,   /* PAGE_SIZE                  */
-         max_tokens,  /* MAX_TOKENS                 */
-         "false",     /* PARTITION_KV               */
-         1            /* NUM_KV_CHUNKS              */
+         num_q_heads_per_task, /* NUM_QO_HEADS               */
+         kv_heads_per_task,    /* NUM_KV_HEADS               */
+         num_qo_groups,        /* NUM_QO_GROUPS              */
+         kv_stride,            /* KV_CACHE_STRIDE            */
+         qkv_stride,           /* QKV_STRIDE                 */
+         output_size,          /* O_STRIDE (= num_q_heads*head_dim) */
+         head_dim,             /* HEAD_DIM                   */
+         -1,                   /* SEQ_LEN (not used for non-split KV tasks) */
+         max_seq_len,          /* MAX_SEQ_LEN                */
+         page_size,            /* PAGE_SIZE                  */
+         max_tokens,           /* MAX_TOKENS                 */
+         "false",              /* PARTITION_KV               */
+         1                     /* NUM_KV_CHUNKS              */
   );
-  code.e("    task_desc->input_ptrs[1],");
-  code.e("    task_desc->input_ptrs[2],");
-  code.e("    runtime_config.qo_indptr_buffer,");
-  code.e("    runtime_config.paged_kv_indptr_buffer,");
-  code.e("    runtime_config.paged_kv_indices_buffer,");
-  code.e("    runtime_config.paged_kv_last_page_len_buffer,");
-  code.e("    task_desc->task_metadata.request_id,");
-  code.e("    $,", params[2] > 0); // qk_norm
-  code.e("    $,", params[3] > 0); // rope
-  code.e("    task_desc->input_ptrs[3],");
-  code.e("    task_desc->input_ptrs[4],");
-  code.e("    task_desc->input_ptrs[5],");
-  code.e("    task_desc->input_ptrs[6],");
-  code.e("    1e-6f,");
-  code.e("    1e-6f,");
-  code.e("    task_desc->input_ptrs[0],");
-  code.e("    task_desc->output_ptrs[0],");
-  code.e("    nullptr,"); // lse, not used for non-split KV tasks
-  code.e("    0);");      // kv_idx, not used for non-split KV tasks
+  code.e("        task_desc->input_ptrs[1],");
+  code.e("        task_desc->input_ptrs[2],");
+  code.e("        runtime_config.qo_indptr_buffer,");
+  code.e("        runtime_config.paged_kv_indptr_buffer,");
+  code.e("        runtime_config.paged_kv_indices_buffer,");
+  code.e("        runtime_config.paged_kv_last_page_len_buffer,");
+  code.e("        request_id,");
+  code.e("        $,", params[2] > 0); // qk_norm
+  code.e("        $,", params[3] > 0); // rope
+  code.e("        task_desc->input_ptrs[3],");
+  code.e("        task_desc->input_ptrs[4],");
+  code.e("        task_desc->input_ptrs[5],");
+  code.e("        task_desc->input_ptrs[6],");
+  code.e("        1e-6f,");
+  code.e("        1e-6f,");
+  code.e("        task_desc->input_ptrs[0],");
+  code.e("        task_desc->output_ptrs[0],");
+  code.e("        nullptr,"); // lse, not used for non-split KV tasks
+  code.e("        0);");      // kv_idx, not used for non-split KV tasks
+  code.e("  }");
 
   return register_task_variant(TASK_PAGED_ATTENTION_HOPPER, code.to_string());
 }
@@ -1916,13 +1982,16 @@ int TaskRegister::register_splitk_linear_sm100_task(
 
 int TaskRegister::register_paged_attention_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  // params[0]: num_q_heads
-  // params[1]: num_kv_heads
+  // params[0]: total_num_q_heads
+  // params[1]: total_num_kv_heads
   // params[2]: qk_norm
   // params[3]: rotary_emd
   // params[4]: max_seq_len
   // params[5]: page_size
-  assert(params.size() == 6);
+  // params[6]: max_tokens (optional)
+  // params[7]: requests_per_task (optional, default 1)
+  // params[8]: kv_heads_per_task (optional, default 1)
+  assert(params.size() >= 6 && params.size() <= 9);
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
   int num_inputs = 7;
@@ -1946,6 +2015,14 @@ int TaskRegister::register_paged_attention_sm100_task(
   int kv_stride = head_dim * num_kv_heads;
   int max_seq_len = params[4];
   int page_size = params[5];
+  int max_tokens =
+      params.size() >= 7 ? params[6] : static_cast<int>(input_ops[0]->dtensor.dim[0]);
+  int requests_per_task = params.size() >= 8 ? params[7] : 1;
+  int kv_heads_per_task = params.size() >= 9 ? params[8] : 1;
+  assert(requests_per_task > 0);
+  assert(kv_heads_per_task > 0);
+  assert(num_kv_heads % kv_heads_per_task == 0);
+  int num_q_heads_per_task = (num_q_heads / num_kv_heads) * kv_heads_per_task;
   // Assert that k_cache has the same head_dim
   assert(input_ops[1]->output_tensors[0].num_dims == 4);
   assert(head_dim == input_ops[1]->output_tensors[0].dim[3]);
@@ -1954,34 +2031,43 @@ int TaskRegister::register_paged_attention_sm100_task(
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::multitoken_paged_attention_sm100_task_impl<bfloat16, $, $, "
+  code.e("  int request_start = task_desc->task_metadata.request_id * $;",
+         requests_per_task);
+  code.e("  int request_end = request_start + $;", requests_per_task);
+  code.e("  if (request_end > MPK_MAX_NUM_BATCHED_REQUESTS) {");
+  code.e("    request_end = MPK_MAX_NUM_BATCHED_REQUESTS;");
+  code.e("  }");
+  code.e("  for (int request_id = request_start; request_id < request_end; ++request_id) {");
+  code.e("    kernel::multitoken_paged_attention_sm100_task_impl<bfloat16, $, $, "
          "$, $, "
-         "$, $, $, $>(",
-         num_q_heads / num_kv_heads,
-         1,
+         "$, $, $, $, $>(",
+         num_q_heads_per_task,
+         kv_heads_per_task,
          kv_stride,
          qkv_stride,
          output_size,
          head_dim,
          max_seq_len,
-         page_size);
-  code.e("    task_desc->input_ptrs[0],");
-  code.e("    task_desc->input_ptrs[1],");
-  code.e("    task_desc->input_ptrs[2],");
-  code.e("    task_desc->output_ptrs[0],");
-  code.e("    runtime_config.qo_indptr_buffer,");
-  code.e("    runtime_config.paged_kv_indptr_buffer,");
-  code.e("    runtime_config.paged_kv_indices_buffer,");
-  code.e("    runtime_config.paged_kv_last_page_len_buffer,");
-  code.e("    task_desc->task_metadata.request_id,");
-  code.e("    $,", params[2] > 0);
-  code.e("    $,", params[3] > 0);
-  code.e("    task_desc->input_ptrs[3],");
-  code.e("    task_desc->input_ptrs[4],");
-  code.e("    task_desc->input_ptrs[5],");
-  code.e("    task_desc->input_ptrs[6],");
-  code.e("    1e-6f,");
-  code.e("    1e-6f);");
+         page_size,
+         max_tokens);
+  code.e("        task_desc->input_ptrs[0],");
+  code.e("        task_desc->input_ptrs[1],");
+  code.e("        task_desc->input_ptrs[2],");
+  code.e("        task_desc->output_ptrs[0],");
+  code.e("        runtime_config.qo_indptr_buffer,");
+  code.e("        runtime_config.paged_kv_indptr_buffer,");
+  code.e("        runtime_config.paged_kv_indices_buffer,");
+  code.e("        runtime_config.paged_kv_last_page_len_buffer,");
+  code.e("        request_id,");
+  code.e("        $,", params[2] > 0);
+  code.e("        $,", params[3] > 0);
+  code.e("        task_desc->input_ptrs[3],");
+  code.e("        task_desc->input_ptrs[4],");
+  code.e("        task_desc->input_ptrs[5],");
+  code.e("        task_desc->input_ptrs[6],");
+  code.e("        1e-6f,");
+  code.e("        1e-6f);");
+  code.e("  }");
   return register_task_variant(TASK_ATTN_SM100, code.to_string());
 }
 

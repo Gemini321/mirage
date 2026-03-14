@@ -64,10 +64,35 @@ static PyObject *finalize_func(PyObject *self, PyObject *args) {
   Py_RETURN_NONE;
 }
 
+static PyObject *get_timing_func(PyObject *self, PyObject *args) {
+#ifdef MIRAGE_ENABLE_LAUNCH_TIMING
+  float worker_ms = 0.0f;
+  float scheduler_ms = 0.0f;
+  float total_ms = 0.0f;
+  get_last_launch_timing(&worker_ms, &scheduler_ms, &total_ms);
+  return Py_BuildValue("(fff)", worker_ms, scheduler_ms, total_ms);
+#else
+  return Py_BuildValue("(fff)", 0.0f, 0.0f, 0.0f);
+#endif
+}
+
+static PyObject *set_enable_timing_func(PyObject *self, PyObject *args) {
+  int enable = 0;
+  if (!PyArg_ParseTuple(args, "i", &enable)) {
+    return NULL;
+  }
+#ifdef MIRAGE_ENABLE_LAUNCH_TIMING
+  set_enable_launch_timing(enable);
+#endif
+  Py_RETURN_NONE;
+}
+
 static PyMethodDef ModuleMethods[] = {
   {"init_func", init_func, METH_VARARGS, "initialize persistent kernel"},
   {"launch_func", launch_func, METH_VARARGS, "launch persistent kernel"},
   {"finalize_func", finalize_func, METH_VARARGS, "finalize persistent kernel"},
+  {"get_timing_func", get_timing_func, METH_VARARGS, "get last launch timing"},
+  {"set_enable_timing_func", set_enable_timing_func, METH_VARARGS, "enable/disable launch timing"},
   {NULL, NULL, 0, NULL} // sentinel
 };
 
@@ -110,6 +135,7 @@ def get_compile_command(
     mpi_lib_path,
     py_so_path,
     profiling,
+    enable_launch_timing,
     use_nvshmem,
     num_workers=None,
     num_local_schedulers=None,
@@ -146,6 +172,19 @@ def get_compile_command(
         f"-DMAX_WORKER_PER_SCHEDULER={max_worker_per_scheduler}",
         f"-DMIRAGE_USE_CUTLASS_KERNEL={'1' if use_cutlass_kernel else '0'}",
     ]
+    ptxas_opt_level_env = os.environ.get("MIRAGE_PTXAS_OPT_LEVEL", "").strip()
+    if ptxas_opt_level_env:
+        try:
+            ptxas_opt_level = int(ptxas_opt_level_env)
+        except ValueError as ex:
+            raise ValueError(
+                f"Invalid MIRAGE_PTXAS_OPT_LEVEL={ptxas_opt_level_env}; expected integer 0..3"
+            ) from ex
+        if ptxas_opt_level < 0 or ptxas_opt_level > 3:
+            raise ValueError(
+                f"Invalid MIRAGE_PTXAS_OPT_LEVEL={ptxas_opt_level_env}; expected 0..3"
+            )
+        common_cmd += ["-Xptxas", f"-O{ptxas_opt_level}"]
 
     flags = [
         "-shared",
@@ -179,6 +218,7 @@ def get_compile_command(
     # flags = flags + [f"-DMIRAGE_ADMISSION_DEBUG"]
     # flags = flags + [f"-DMIRAGE_SCHED_LOG"]
     # flags = flags + [f"-DMIRAGE_WORKER_LOG"]
+    # flags = flags + [f"-DMIRAGE_USE_BALANCED_SCHEDULER=0"]
 
     if use_nvshmem:
         nvshmem_cmd = [
@@ -213,6 +253,8 @@ def get_compile_command(
     
     if profiling:
         flags = flags + ["-DMPK_ENABLE_PROFILING"]
+    if enable_launch_timing:
+        flags = flags + ["-DMIRAGE_ENABLE_LAUNCH_TIMING"]
 
     return common_cmd + specific_cmd + flags
 
@@ -236,7 +278,8 @@ class PersistentKernel:
         profiler_tensor: torch.Tensor,
         trace_name: str,
         spec_decode_config: SpecDecodeConfig,
-        use_cutlass_kernel: bool
+        use_cutlass_kernel: bool,
+        enable_launch_timing: bool = False,
     ):
         self.__finalized__ = False
         self._is_compiled = False
@@ -261,11 +304,21 @@ class PersistentKernel:
         self.use_nvshmem = True if world_size > 1 else False
         self.spec_decode_config = spec_decode_config
         self.use_cutlass_kernel = use_cutlass_kernel
+        self.enable_launch_timing = bool(enable_launch_timing)
         self._spec_decode_handlers = {
             "promptlookup": self.prompt_lookup_spec_handler,
         }
         self._spec_verify_handlers = {
             "promptlookup": self.prompt_lookup_verify_handler,
+        }
+        self.get_timing_func = None
+        self.set_enable_timing_func = None
+        self._set_enable_timing_func_raw = None
+        self._timing_enabled = False
+        self.last_launch_timing = {
+            "worker_ms": 0.0,
+            "scheduler_ms": 0.0,
+            "total_ms": 0.0,
         }
         # determine total number of requests for offline serving
         self.total_num_requests = meta_tensors["tokens"].shape[0]
@@ -293,6 +346,136 @@ class PersistentKernel:
         assert name is not None
         self.kn_graph.attach_torch_tensor(t, torch_tensor, name)
         return t
+
+    def _build_meta_tensor_ptrs(self):
+        meta_tensors = [
+            self.meta_tensors["step"],
+            self.meta_tensors["tokens"],
+            self.meta_tensors["input_tokens"],
+            self.meta_tensors["output_tokens"],
+            self.meta_tensors["num_new_tokens"],
+            self.meta_tensors["prompt_lengths"],
+            self.meta_tensors["qo_indptr_buffer"],
+            self.meta_tensors["paged_kv_indptr_buffer"],
+            self.meta_tensors["paged_kv_indices_buffer"],
+            self.meta_tensors["paged_kv_last_page_len_buffer"],
+        ]
+        meta_tensors_ptr = [tensor.data_ptr() for tensor in meta_tensors]
+        profiler_buffer_ptr = (
+            self.profiler_tensor.data_ptr() if self.profiler_tensor is not None else 0
+        )
+        return meta_tensors_ptr, profiler_buffer_ptr
+
+    def emit_task_graph_files(self, artifact_dir: str, prefix: str = "test"):
+        os.makedirs(artifact_dir, exist_ok=True)
+        results = self.kn_graph.generate_task_graph(
+            num_gpus=self.world_size, my_gpu_id=self.mpi_rank
+        )
+        cuda_code_path = os.path.join(artifact_dir, f"{prefix}.cu")
+        json_file_path = os.path.join(artifact_dir, f"{prefix}_task_graph.json")
+        # Generated launcher code reads "task_graph.json" from artifact dir.
+        # Keep both names so profiling artifacts remain namespaced by prefix
+        # while runtime can always find the canonical file.
+        canonical_json_path = os.path.join(artifact_dir, "task_graph.json")
+        with open(json_file_path, "w") as f:
+            f.write(results["json_file"])
+        if canonical_json_path != json_file_path:
+            with open(canonical_json_path, "w") as f:
+                f.write(results["json_file"])
+        with open(cuda_code_path, "w") as f:
+            f.write(results["cuda_code"] + HARD_CODE)
+        return {
+            "results": results,
+            "cuda_code_path": cuda_code_path,
+            "json_file_path": json_file_path,
+        }
+
+    def build_compile_command(self, cuda_code_path: str, so_path: str):
+        cc = shutil.which("nvcc")
+        if cc is None:
+            raise RuntimeError("nvcc not found. Please make sure you have installed CUDA.")
+        if hasattr(sysconfig, "get_default_scheme"):
+            scheme = sysconfig.get_default_scheme()
+        else:
+            scheme = sysconfig._get_default_scheme()
+        if scheme == "posix_local":
+            scheme = "posix_prefix"
+        py_include_dir = sysconfig.get_paths(scheme=scheme)["include"]
+
+        _, INCLUDE_PATH, DEPS_PATH = get_key_paths()
+        if "MIRAGE_HOME" in os.environ:
+            MIRAGE_HOME_PATH = os.environ.get("MIRAGE_HOME")
+        else:
+            raise RuntimeError(
+                "MIRAGE_HOME unspecified; Please set MIRAGE_HOME to be the root of the Mirage folder"
+            )
+
+        NVSHMEM_INC_PATH = None
+        NVSHMEM_LIB_PATH = None
+        MPI_INC_PATH = None
+        MPI_LIB_PATH = None
+        if self.use_nvshmem:
+            NVSHMEM_INC_PATH = os.environ.get("NVSHMEM_INC_PATH", "/usr/include/nvshmem_12/")
+            NVSHMEM_LIB_PATH = os.environ.get("NVSHMEM_LIB_PATH", "/usr/lib/x86_64-linux-gnu/")
+            MPI_INC_PATH = os.environ.get("MPI_INC_PATH", "/usr/include/")
+            MPI_LIB_PATH = os.environ.get("MPI_LIB_PATH", "/usr/lib/")
+        return get_compile_command(
+            mpk=self,
+            target_cc=self.target_cc,
+            cc=cc,
+            file_name=cuda_code_path,
+            py_include_dir=py_include_dir,
+            mirage_home_path=MIRAGE_HOME_PATH,
+            mirage_inc_path=INCLUDE_PATH,
+            mirage_deps_path=DEPS_PATH,
+            nvshmem_inc_path=NVSHMEM_INC_PATH,
+            nvshmem_lib_path=NVSHMEM_LIB_PATH,
+            mpi_inc_path=MPI_INC_PATH,
+            mpi_lib_path=MPI_LIB_PATH,
+            py_so_path=so_path,
+            profiling=True if self.profiler_tensor is not None else False,
+            enable_launch_timing=self.enable_launch_timing,
+            use_nvshmem=self.use_nvshmem,
+            num_workers=self.num_workers,
+            num_local_schedulers=self.num_local_schedulers,
+            num_remote_schedulers=self.num_remote_schedulers,
+            use_cutlass_kernel=self.use_cutlass_kernel,
+        )
+
+    def load_compiled_module_from_path(self, so_path: str):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("__mirage_launcher", so_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.init_func = getattr(mod, "init_func")
+        self.launch_func = getattr(mod, "launch_func")
+        self.finalize_func = getattr(mod, "finalize_func")
+        self.get_timing_func = getattr(mod, "get_timing_func", None)
+        self._set_enable_timing_func_raw = getattr(mod, "set_enable_timing_func", None)
+        self._timing_enabled = False
+        if self._set_enable_timing_func_raw is not None:
+            def _set_enable_timing(enable):
+                self._set_enable_timing_func_raw(int(enable))
+                self._timing_enabled = bool(enable)
+            self.set_enable_timing_func = _set_enable_timing
+        else:
+            self.set_enable_timing_func = None
+
+    def initialize_runtime(self):
+        meta_tensors_ptr, profiler_buffer_ptr = self._build_meta_tensor_ptrs()
+        self.init_func(
+            meta_tensors_ptr,
+            profiler_buffer_ptr,
+            self.mpi_rank,
+            self.num_workers,
+            self.num_local_schedulers,
+            self.num_remote_schedulers,
+            self.max_seq_length,
+            self.total_num_requests,
+            self.eos_token_id,
+        )
+        self._is_compiled = True
 
     def new_tensor(
         self,
@@ -554,6 +737,7 @@ class PersistentKernel:
         output: DTensor,
         grid_dim: tuple,
         block_dim: tuple,
+        max_tokens: int = None,
     ):
         # Currently assume that input/output
         assert input.num_dims == 2  # (num_tokens, fused_outdim / world_size)
@@ -582,17 +766,36 @@ class PersistentKernel:
             assert q_norm.dim(0) == head_dim
             assert k_norm.dim(0) == head_dim
 
-        # params[0]: num_q_heads
-        # params[1]: num_kv_heads
+        # params[0]: total_num_q_heads
+        # params[1]: total_num_kv_heads
         # params[2]: qk_norm
         # params[3]: rotary_embed
         # params[4]: max_seq_len
         # params[5]: page_size
-        params = [num_q_heads, num_kv_heads, qk_norm, rotary_embed, self.max_seq_length, self.page_size]
+        # params[6]: max_tokens
+        # params[7]: requests_per_task
+        # params[8]: kv_heads_per_task
+        effective_max_tokens = input.dim(0) if max_tokens is None else int(max_tokens)
+        assert grid_dim[0] > 0 and grid_dim[1] > 0 and grid_dim[2] > 0
+        requests_per_task = (self.max_num_batched_requests + int(grid_dim[0]) - 1) // int(grid_dim[0])
+        if num_kv_heads % int(grid_dim[1]) != 0:
+            raise ValueError(
+                f"paged_attention_layer grid_dim.y={grid_dim[1]} must divide num_kv_heads={num_kv_heads}"
+            )
+        kv_heads_per_task = num_kv_heads // int(grid_dim[1])
+        params = [
+            num_q_heads,
+            num_kv_heads,
+            qk_norm,
+            rotary_embed,
+            self.max_seq_length,
+            self.page_size,
+            effective_max_tokens,
+            requests_per_task,
+            kv_heads_per_task,
+        ]
 
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
-        assert grid_dim[0] == self.max_num_batched_requests
-        assert grid_dim[1] == num_kv_heads
         tb_graph.new_input(input, (-1, 1, -1), -1, True)
         tb_graph.new_input(k_cache, (-1, 2, -1), 1, True)
         tb_graph.new_input(v_cache, (-1, 2, -1), 1, True)
@@ -928,6 +1131,7 @@ class PersistentKernel:
         output: DTensor,
         grid_dim: tuple,
         block_dim: tuple,
+        pipe_stage: int = None,
     ):
         # Currently assume that input/output
         assert input.num_dims == 2  # (batch_size, hidden_size / world_size)
@@ -956,7 +1160,10 @@ class PersistentKernel:
             else:
                 self.kn_graph.register_task(tb_graph, "linear_swapAB_hopper")
         elif self.target_cc == 80:
-            self.kn_graph.register_task(tb_graph, "linear")
+            effective_pipe_stage = 3 if pipe_stage is None else int(pipe_stage)
+            self.kn_graph.register_task(tb_graph,
+                                        "linear",
+                                        [effective_pipe_stage])
         else:
             assert False
 
@@ -968,6 +1175,7 @@ class PersistentKernel:
         output: DTensor,
         grid_dim: tuple,
         block_dim: tuple,
+        pipe_stage: int = None,
     ):
         # Currently assume that input/output
         assert input.num_dims == 2  # (batch_size, hidden_size / world_size)
@@ -975,20 +1183,35 @@ class PersistentKernel:
         assert residual.num_dims == 2  # (batch_size, hidden_size)
         assert output.num_dims == 2  # (batch_size, hidden_size)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
-        # tb_graph.new_input(input, (-1, -1, -1), 1, True)
-        # tb_graph.new_input(weight, (0, -1, -1), 1, True)
-        # tb_graph.new_input(residual, (1, -1, -1), -1, True)
-        # tb_graph.new_input(output, (1, -1, -1), -1, True)
-        # gridDim = (split_output_size, split_batch_size, 1)
-        # tb_graph.new_input(input, (-1, 0, -1), 1, True)
-        # tb_graph.new_input(weight, (0, -1, -1), 1, True)
-        # tb_graph.new_input(residual, (1, 0, -1), -1, True)
-        # tb_graph.new_input(output, (1, 0, -1), -1, True)
-        # # gridDim = (split_batch_size, split_output_size, 1)
-        tb_graph.new_input(input, (0, -1, -1), 1, True)
-        tb_graph.new_input(weight, (-1, 0, -1), 1, True)
-        tb_graph.new_input(residual, (0, 1, -1), -1, True)
-        tb_graph.new_input(output, (0, 1, -1), -1, True)
+        def _mapping_valid(tensor: DTensor, input_map: tuple) -> bool:
+            for axis, dim_idx in enumerate(input_map):
+                if dim_idx < 0:
+                    continue
+                div = grid_dim[axis]
+                if div > 1 and tensor.dim(dim_idx) % div != 0:
+                    return False
+            return True
+
+        # Prefer the newer split-batch mapping when it is valid, but fall back
+        # to the original layout for graphs whose batch dimension is smaller
+        # than grid_dim.x (e.g. standardized Llama bs=1 with grid_dim.x=32).
+        split_batch_layout = [
+            (input, (0, -1, -1), 1),
+            (weight, (-1, 0, -1), 1),
+            (residual, (0, 1, -1), -1),
+            (output, (0, 1, -1), -1),
+        ]
+        baseline_layout = [
+            (input, (-1, -1, -1), 1),
+            (weight, (0, -1, -1), 1),
+            (residual, (1, -1, -1), -1),
+            (output, (1, -1, -1), -1),
+        ]
+        layout = split_batch_layout
+        if not all(_mapping_valid(tensor, input_map) for tensor, input_map, _ in split_batch_layout):
+            layout = baseline_layout
+        for tensor, input_map, tensor_forloop_dim in layout:
+            tb_graph.new_input(tensor, input_map, tensor_forloop_dim, True)
         self.kn_graph.customized([input, weight, residual, output], tb_graph)
         
         if self.target_cc == 100:
@@ -1000,7 +1223,10 @@ class PersistentKernel:
             else:
                 self.kn_graph.register_task(tb_graph, "linear_swapAB_with_residual_hopper")
         elif self.target_cc == 80:
-            self.kn_graph.register_task(tb_graph, "linear_with_residual")
+            effective_pipe_stage = 3 if pipe_stage is None else int(pipe_stage)
+            self.kn_graph.register_task(tb_graph,
+                                        "linear_with_residual",
+                                        [effective_pipe_stage])
         else:
             assert False
 
@@ -1317,7 +1543,8 @@ class PersistentKernel:
         results = self.kn_graph.generate_task_graph(num_gpus=self.world_size, my_gpu_id=self.mpi_rank)
 
         cuda_code_path = os.path.join(tempdir, "test.cu")
-        so_path = os.path.join(tempdir, "test.cpython-38-x86_64-linux-gnu.so")
+        ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+        so_path = os.path.join(tempdir, f"test{ext_suffix}")
         # check json file
         json_file_path = os.path.join(tempdir, "task_graph.json")
         with open(json_file_path, "w") as f:
@@ -1435,6 +1662,7 @@ class PersistentKernel:
             mpi_lib_path=MPI_LIB_PATH,
             py_so_path=so_path,
             profiling=True if self.profiler_tensor is not None else False,
+            enable_launch_timing=self.enable_launch_timing,
             use_nvshmem=self.use_nvshmem,
             num_workers=self.num_workers,
             num_local_schedulers=self.num_local_schedulers, 
@@ -1453,24 +1681,20 @@ class PersistentKernel:
         self.init_func = getattr(mod, "init_func")
         self.launch_func = getattr(mod, "launch_func")
         self.finalize_func = getattr(mod, "finalize_func")
+        self.get_timing_func = getattr(mod, "get_timing_func", None)
+        self._set_enable_timing_func_raw = getattr(mod, "set_enable_timing_func", None)
+        self._timing_enabled = False
+        if self._set_enable_timing_func_raw is not None:
+            def _set_enable_timing(enable):
+                self._set_enable_timing_func_raw(int(enable))
+                self._timing_enabled = bool(enable)
+            self.set_enable_timing_func = _set_enable_timing
+        else:
+            self.set_enable_timing_func = None
         print("Finished megakernel compilation...")
 
         #meta_tensors_ptr = [tensor.data_ptr() for tensor in self.meta_tensors]
-        meta_tensors = list()
-        meta_tensors.append(self.meta_tensors["step"])
-        meta_tensors.append(self.meta_tensors["tokens"])
-        meta_tensors.append(self.meta_tensors["input_tokens"])
-        meta_tensors.append(self.meta_tensors["output_tokens"])
-        meta_tensors.append(self.meta_tensors["num_new_tokens"])
-        meta_tensors.append(self.meta_tensors["prompt_lengths"])
-        meta_tensors.append(self.meta_tensors["qo_indptr_buffer"])
-        meta_tensors.append(self.meta_tensors["paged_kv_indptr_buffer"])
-        meta_tensors.append(self.meta_tensors["paged_kv_indices_buffer"])
-        meta_tensors.append(self.meta_tensors["paged_kv_last_page_len_buffer"])
-        meta_tensors_ptr = [tensor.data_ptr() for tensor in meta_tensors]
-        profiler_buffer_ptr = (
-            self.profiler_tensor.data_ptr() if self.profiler_tensor is not None else 0
-        )
+        meta_tensors_ptr, profiler_buffer_ptr = self._build_meta_tensor_ptrs()
         self.init_func(
             meta_tensors_ptr,
             profiler_buffer_ptr,
@@ -1492,6 +1716,13 @@ class PersistentKernel:
         # if stream is None:
         #    stream = torch.cuda.default_stream()
         self.launch_func()
+        if self._timing_enabled and self.get_timing_func is not None:
+            worker_ms, scheduler_ms, total_ms = self.get_timing_func()
+            self.last_launch_timing = {
+                "worker_ms": float(worker_ms),
+                "scheduler_ms": float(scheduler_ms),
+                "total_ms": float(total_ms),
+            }
         if self.profiler_tensor is not None:
             from .profiler_persistent import export_to_perfetto_trace
             

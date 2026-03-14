@@ -189,7 +189,7 @@ __device__ __forceinline__ void
 // from the inlined task body does not cross the setmaxnreg transition points.
 // This improves the chance that ptxas can honor wg_decrease_regs<> without
 // emitting (C7507) "setmaxnreg ignored".
-__device__ __forceinline__ void
+__device__ __noinline__ void
     __mirage_execute_task_noinline(TaskDesc const *task_desc,
                                    RuntimeConfig const &runtime_config,
                                    void *exec_ctx,
@@ -2025,7 +2025,6 @@ __device__ __forceinline__ void execute_scheduler_balanced(RuntimeConfig config,
                                                            int offset) {
   int const num_schedulers =
       config.num_local_schedulers + config.num_remote_schedulers;
-  int const warp_id = threadIdx.x / 32;
   if (threadIdx.x % 32 == 0) {
     int const sched_id = blockIdx.x + offset;
     size_t iteration_num = 0;
@@ -2617,7 +2616,6 @@ __global__ __launch_bounds__(WORKER_NUM_THREADS * 2,
 
 __global__ void scheduler_kernel(RuntimeConfig config) {
   scheduler_checker(config);
-  // execute_scheduler(config, 0);
   execute_scheduler_balanced(config, 0);
 }
 
@@ -2648,6 +2646,31 @@ static void _init_persistent_kernel(std::vector<FullTaskDesc> &all_tasks,
                                     int my_gpu_id);
 
 static RuntimeConfig global_runtime_config;
+
+#ifdef MIRAGE_ENABLE_LAUNCH_TIMING
+static float global_last_worker_ms = 0.0f;
+static float global_last_scheduler_ms = 0.0f;
+static float global_last_total_ms = 0.0f;
+static bool global_enable_timing = false;
+
+extern "C" void set_enable_launch_timing(int enable) {
+  global_enable_timing = (enable != 0);
+}
+
+extern "C" void get_last_launch_timing(float *worker_ms,
+                                       float *scheduler_ms,
+                                       float *total_ms) {
+  if (worker_ms != nullptr) {
+    *worker_ms = global_last_worker_ms;
+  }
+  if (scheduler_ms != nullptr) {
+    *scheduler_ms = global_last_scheduler_ms;
+  }
+  if (total_ms != nullptr) {
+    *total_ms = global_last_total_ms;
+  }
+}
+#endif
 
 // meta_tensors[0]: seq_length
 // meta_tensors[1]: tokens
@@ -2916,20 +2939,18 @@ extern "C" void launch_persistent_kernel() {
 	    // printf("worker threads: %d, scheduler threads: %d\n", worker_threads, 32);
 
       cudaProfilerStart();
-      // #define MIRAGE_PROFILE_TIME
-#if defined(MIRAGE_PROFILE_TIME)
-	    // Precise timing (GPU events) for split worker/scheduler kernels.
-	    cudaEvent_t worker_start, worker_end, sched_start, sched_end, total_end;
-	    CUDA_CHECK(cudaEventCreate(&worker_start));
-	    CUDA_CHECK(cudaEventCreate(&worker_end));
-	    CUDA_CHECK(cudaEventCreate(&sched_start));
-	    CUDA_CHECK(cudaEventCreate(&sched_end));
-	    CUDA_CHECK(cudaEventCreate(&total_end));
-
-	    // The split kernel does not support NVSHMEM because
-	    // nvshmemx_collective_launch launches kernels sequentially, which blocks
-	    // the interaction between the worker kernel and the scheduler kernel
-	    CUDA_CHECK(cudaEventRecord(worker_start, global_runtime_config.worker_stream));
+#ifdef MIRAGE_ENABLE_LAUNCH_TIMING
+      // Precise timing (GPU events) for split worker/scheduler kernels.
+      // Only enabled when global_enable_timing is set (autotune worker mode).
+      cudaEvent_t worker_start, worker_end, sched_start, sched_end, total_end;
+      if (global_enable_timing) {
+      CUDA_CHECK(cudaEventCreate(&worker_start));
+      CUDA_CHECK(cudaEventCreate(&worker_end));
+      CUDA_CHECK(cudaEventCreate(&sched_start));
+      CUDA_CHECK(cudaEventCreate(&sched_end));
+      CUDA_CHECK(cudaEventCreate(&total_end));
+      CUDA_CHECK(cudaEventRecord(worker_start, global_runtime_config.worker_stream));
+      }
 #endif
       // Launch worker kernel
 	    worker_kernel<<<dim3(global_runtime_config.num_workers, 1, 1),
@@ -2938,11 +2959,12 @@ extern "C" void launch_persistent_kernel() {
 	                    global_runtime_config.worker_stream>>>(
 	        global_runtime_config);
 
-#if defined(MIRAGE_PROFILE_TIME)
-	    CUDA_CHECK(cudaGetLastError());
-	    CUDA_CHECK(cudaEventRecord(worker_end, global_runtime_config.worker_stream));
-
-	    CUDA_CHECK(cudaEventRecord(sched_start, global_runtime_config.scheduler_stream));
+#ifdef MIRAGE_ENABLE_LAUNCH_TIMING
+      if (global_enable_timing) {
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaEventRecord(worker_end, global_runtime_config.worker_stream));
+      CUDA_CHECK(cudaEventRecord(sched_start, global_runtime_config.scheduler_stream));
+      }
 #endif
 
       // Launch scheduler kernel
@@ -3017,32 +3039,32 @@ extern "C" void launch_persistent_kernel() {
 // 	      CUDA_CHECK(cudaEventDestroy(sched_done_evt));
 // #endif
 
-#if defined(MIRAGE_PROFILE_TIME)
-	    CUDA_CHECK(cudaGetLastError());
-	    CUDA_CHECK(cudaEventRecord(sched_end, global_runtime_config.scheduler_stream));
+#ifdef MIRAGE_ENABLE_LAUNCH_TIMING
+      if (global_enable_timing) {
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaEventRecord(sched_end, global_runtime_config.scheduler_stream));
 
-	    // Total time: from worker_start until both kernels complete.
-	    CUDA_CHECK(cudaStreamWaitEvent(global_runtime_config.worker_stream, sched_end, 0));
-	    CUDA_CHECK(cudaEventRecord(total_end, global_runtime_config.worker_stream));
-	    CUDA_CHECK(cudaEventSynchronize(total_end));
+      // Total time: from worker_start until both kernels complete.
+      CUDA_CHECK(cudaStreamWaitEvent(global_runtime_config.worker_stream, sched_end, 0));
+      CUDA_CHECK(cudaEventRecord(total_end, global_runtime_config.worker_stream));
+      CUDA_CHECK(cudaEventSynchronize(total_end));
 
-	    float worker_ms = 0.0f;
-	    float sched_ms = 0.0f;
-	    float total_ms = 0.0f;
-	    CUDA_CHECK(cudaEventElapsedTime(&worker_ms, worker_start, worker_end));
-	    CUDA_CHECK(cudaEventElapsedTime(&sched_ms, sched_start, sched_end));
-	    CUDA_CHECK(cudaEventElapsedTime(&total_ms, worker_start, total_end));
-	    printf("[TIME][%d workers] worker_kernel=%.3f ms scheduler_kernel=%.3f ms total=%.3f ms\n",
-              global_runtime_config.num_workers,
-	           (double)worker_ms,
-	           (double)sched_ms,
-	           (double)total_ms);
+      float worker_ms = 0.0f;
+      float sched_ms = 0.0f;
+      float total_ms = 0.0f;
+      CUDA_CHECK(cudaEventElapsedTime(&worker_ms, worker_start, worker_end));
+      CUDA_CHECK(cudaEventElapsedTime(&sched_ms, sched_start, sched_end));
+      CUDA_CHECK(cudaEventElapsedTime(&total_ms, worker_start, total_end));
+      global_last_worker_ms = worker_ms;
+      global_last_scheduler_ms = sched_ms;
+      global_last_total_ms = total_ms;
 
-	    CUDA_CHECK(cudaEventDestroy(worker_start));
-	    CUDA_CHECK(cudaEventDestroy(worker_end));
-	    CUDA_CHECK(cudaEventDestroy(sched_start));
-	    CUDA_CHECK(cudaEventDestroy(sched_end));
-	    CUDA_CHECK(cudaEventDestroy(total_end));
+      CUDA_CHECK(cudaEventDestroy(worker_start));
+      CUDA_CHECK(cudaEventDestroy(worker_end));
+      CUDA_CHECK(cudaEventDestroy(sched_start));
+      CUDA_CHECK(cudaEventDestroy(sched_end));
+      CUDA_CHECK(cudaEventDestroy(total_end));
+      }
 #endif
 
 	    // Keep legacy sync+error check for compatibility with existing call sites.

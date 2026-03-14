@@ -56,6 +56,7 @@ def parse_arguments():
     )
     parser.add_argument("--ignore-eos", action="store_true", help="Ignore eos token during generation")
     parser.add_argument("--max-new-tokens", type=int, default=None, help="Decode cap for CI determinism")
+    parser.add_argument("--prompt-tokens", type=int, default=None, help="Force prompt token length after chat template")
     parser.add_argument(
         "--prompt",
         type=str,
@@ -151,6 +152,18 @@ def max_factor_leq_n(m: int, n: int) -> int:
     return max_factor
 
 
+def safe_decode_tokens(tokenizer, token_tensor):
+    token_ids = token_tensor.tolist()
+    vocab_size = tokenizer.vocab_size if tokenizer.vocab_size is not None else (1 << 31)
+    safe_ids = [tid if 0 <= tid < vocab_size else tokenizer.unk_token_id for tid in token_ids]
+    if tokenizer.unk_token_id is None:
+        safe_ids = [tid if 0 <= tid < vocab_size else 0 for tid in token_ids]
+    try:
+        return tokenizer.decode(safe_ids, skip_special_tokens=True)
+    except Exception:
+        return tokenizer.decode(safe_ids, skip_special_tokens=False)
+
+
 def prepare_test_prompt(args):
     prompt = args.prompt
     messages = [
@@ -173,19 +186,33 @@ def prepare_input_tensors(model, tokenizer, messages, args, use_mirage=True):
         messages, tokenize=False, add_generation_prompt=True
     )
     model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+    if args.prompt_tokens is not None:
+        target_prompt_tokens = max(1, int(args.prompt_tokens))
+        input_ids = model_inputs.input_ids
+        current_prompt_tokens = input_ids.shape[-1]
+        if current_prompt_tokens > target_prompt_tokens:
+            input_ids = input_ids[:, :target_prompt_tokens]
+        elif current_prompt_tokens < target_prompt_tokens:
+            fill_token_id = tokenizer.pad_token_id
+            if fill_token_id is None:
+                fill_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+            pad = torch.full(
+                (input_ids.shape[0], target_prompt_tokens - current_prompt_tokens),
+                fill_token_id,
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+            input_ids = torch.cat([input_ids, pad], dim=-1)
+        model_inputs.input_ids = input_ids
     print("Model input id shape:", model_inputs.input_ids.shape)
     num_requests = args.max_num_batched_requests if use_mirage else 1
-    prompt_len = model_inputs.input_ids.shape[-1]
-    max_seq_length = args.max_seq_length
-    if args.max_new_tokens is not None:
-        max_seq_length = max(max_seq_length, prompt_len + args.max_new_tokens)
     
     # Prepare tokens tensor
-    tokens = torch.full((num_requests, max_seq_length), 0, dtype=torch.long, device="cuda")
+    tokens = torch.full((num_requests, args.max_seq_length), 0, dtype=torch.long, device="cuda")
     for r in range(num_requests):
-        for i in range(prompt_len):
+        for i in range(model_inputs.input_ids.shape[-1]):
             tokens[r, i] = model_inputs.input_ids[0, i]
-    prompt_lengths = torch.full((num_requests,), prompt_len, dtype=torch.int, device="cuda")
+    prompt_lengths = torch.full((num_requests,), model_inputs.input_ids.shape[-1], dtype=torch.int, device="cuda")
 
     # Prepare position embeddings
     positions = torch.arange(32768).unsqueeze(0).to(model.device)
@@ -195,7 +222,9 @@ def prepare_input_tensors(model, tokenizer, messages, args, use_mirage=True):
     input_tokens = torch.full((args.max_num_batched_tokens, 1), 0, dtype=torch.long, device="cuda")
     output_tokens = torch.full((args.max_num_batched_tokens, 1), 0, dtype=torch.long, device="cuda")
     step = torch.full((num_requests, ), 0, dtype=torch.int32, device="cuda")
-    num_new_tokens = torch.full((num_requests, ), 1, dtype=torch.int32, device="cuda")
+    decode_tokens = args.max_new_tokens if args.max_new_tokens is not None else (max_seq_length - prompt_len)
+    decode_tokens = max(1, int(decode_tokens))
+    num_new_tokens = torch.full((num_requests, ), decode_tokens, dtype=torch.int32, device="cuda")
 
     return {
         'tokens': tokens,
@@ -310,7 +339,7 @@ def create_persistent_kernel(args, world_size, rank, input_data, config, eos_tok
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_pages=args.max_num_pages,
         page_size=args.page_size,
-        eos_token_id=eos_token_id_for_mirage if not args.ignore_eos else -1,
+        eos_token_id=eos_token_id_for_mirage,
         meta_tensors={
                 "step": input_data['step'],
                 "tokens": input_data['tokens'],
@@ -327,7 +356,7 @@ def create_persistent_kernel(args, world_size, rank, input_data, config, eos_tok
         trace_name=args.trace_name,
         spec_decode_config=spec_decode_config,
 
-        use_cutlass_kernel=False,
+        use_cutlass_kernel=args.use_cutlass_kernel,
     )
     
     return mpk, spec_decode_config
@@ -588,13 +617,12 @@ def add_transformer_layer(mpk, layer_idx, layer, x, inputs, tensors, config, wor
     )
     attn_proj_out_dim = config['hidden_size']
     attn_proj_block_dim = get_block_dim()
-    print(f'Attention output projection hidden size: {attn_proj_out_dim}, grid dim: {attn_proj_out_dim // 64}')
     mpk.linear_with_residual_layer(
         input=tensors['attn_out'],
         weight=w_o,
         residual=x,
         output=tensors['attn_proj_out'],
-        grid_dim=(1, attn_proj_out_dim // 64, 1),
+        grid_dim=(attn_proj_out_dim // 64, 1, 1),
         block_dim=(attn_proj_block_dim, 1, 1),
     )
     
@@ -670,13 +698,12 @@ def add_transformer_layer(mpk, layer_idx, layer, x, inputs, tensors, config, wor
     )
     mlp_out_dim = config['hidden_size']
     mlp_out_block_dim = get_block_dim()
-    print(f'MLP output projection hidden size: {mlp_out_dim}, grid dim: {mlp_out_dim // 64}')
     mpk.linear_with_residual_layer(
         input=tensors['silu_mul_out'],
         weight=w_down,
         residual=x,
         output=tensors['mlp_out'],
-        grid_dim=(1, mlp_out_dim // 64, 1),
+        grid_dim=(mlp_out_dim // 64, 1, 1),
         block_dim=(mlp_out_block_dim, 1, 1),
     )
 
@@ -829,7 +856,7 @@ def build_mirage_graph(model, args, world_size, rank, input_data, eos_token_id_f
 # Generation Functions
 # ============================================================================
 
-def run_pytorch_generation(model, input_data, eos_token_ids, output_len=512, ignore_eos=False):
+def run_pytorch_generation(model, input_data, eos_token_ids, output_len=512):
     tokens = input_data['tokens']
     prompt_len = input_data['prompt_lengths'][0].item()  # Get the first batch's prompt length
     position_embeddings = input_data['position_embeddings']
@@ -842,6 +869,7 @@ def run_pytorch_generation(model, input_data, eos_token_ids, output_len=512, ign
     warmup = 0
     
     max_len = tokens.shape[1]
+    end_pos = prompt_len
     for cur_pos in range(prompt_len, min(prompt_len + output_len, max_len)):
         step.fill_(cur_pos - 1)
         input_ids = tokens[:, prev_pos:cur_pos]
@@ -859,8 +887,9 @@ def run_pytorch_generation(model, input_data, eos_token_ids, output_len=512, ign
         next_token = next_token[0, -1]
         tokens[0, cur_pos] = next_token
         prev_pos = cur_pos
+        end_pos = cur_pos + 1
         
-        if (not ignore_eos) and next_token.item() in eos_token_ids:
+        if next_token.item() in eos_token_ids:
             break
             
         if cur_pos == prompt_len + warmup:
@@ -871,7 +900,7 @@ def run_pytorch_generation(model, input_data, eos_token_ids, output_len=512, ign
     torch.cuda.synchronize()
     run_time = starter.elapsed_time(ender)
     
-    return cur_pos, run_time
+    return end_pos, run_time
 
 
 def run_mirage_generation(mpk):
@@ -894,6 +923,10 @@ def run_mirage_generation(mpk):
 def run_generation_comparison(model, tokenizer, args, world_size, rank):
     # Process EOS tokens
     eos_token_id_for_mirage, eos_token_ids = process_eos_tokens(model, tokenizer)
+    if args.ignore_eos:
+        vocab_size = tokenizer.vocab_size if tokenizer.vocab_size is not None else 0
+        eos_token_id_for_mirage = max(eos_token_id_for_mirage + 1, vocab_size + 1)
+        eos_token_ids = []
     
     # Prepare test data
     messages = prepare_test_prompt(args)
@@ -913,7 +946,7 @@ def run_generation_comparison(model, tokenizer, args, world_size, rank):
         print("tokens.shape = ", tokens.shape)
         for r in range(args.max_num_batched_requests):
             generated_ids = tokens[r, : step[r] + 1]
-            response = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            response = safe_decode_tokens(tokenizer, generated_ids)
             num_generated_tokens = (step[r] + 1 - prompt_lengths[r].item())
             print("-"*40)
             print(f"Request {r}:, generate length = {num_generated_tokens}\n")
@@ -928,14 +961,9 @@ def run_generation_comparison(model, tokenizer, args, world_size, rank):
         )
         
     else:
-        max_new_tokens = args.max_new_tokens if args.max_new_tokens is not None else 512
-        max_new_tokens = max(0, min(max_new_tokens, input_data['tokens'].shape[1] - input_data['prompt_lengths'][0].item()))
+        output_len = args.max_new_tokens if args.max_new_tokens is not None else 512
         end_pos, run_time = run_pytorch_generation(
-            model,
-            input_data,
-            eos_token_ids,
-            output_len=max_new_tokens,
-            ignore_eos=args.ignore_eos,
+            model, input_data, eos_token_ids, output_len=output_len
         )
         
         print("="*60)
@@ -944,14 +972,18 @@ def run_generation_comparison(model, tokenizer, args, world_size, rank):
         
         tokens = input_data['tokens']
         generated_ids = tokens[:, :end_pos]
-        response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        response = safe_decode_tokens(tokenizer, generated_ids[0])
         print(response)
         
         prompt_lengths = input_data['prompt_lengths']
-        print(f"\nPrompt length: {prompt_lengths[0].item()}")
-        print(f"Generated length: {end_pos - prompt_lengths[0].item()}")
-        generated_tokens = max(1, end_pos - prompt_lengths[0].item())
-        print(f"Per-token latency: {run_time / generated_tokens:.4f} ms")
+        generated_len = end_pos - prompt_lengths[0].item()
+        print(
+            "Prompt length {}, generate length {}, per-token latency (both prefill and decode): {} ms".format(
+                prompt_lengths[0].item(),
+                generated_len,
+                run_time / max(generated_len, 1),
+            )
+        )
 
 
 def main():
